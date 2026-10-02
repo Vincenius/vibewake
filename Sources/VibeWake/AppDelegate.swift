@@ -8,6 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private let monitor = ActivityMonitor()
     private let sleep = SleepController()
+    private let autopilot = Autopilot()
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var dirWatcher: DispatchSourceFileSystemObject?
@@ -23,6 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private enum IconState { case idle, running, windingDown, paused }
     private var iconState: IconState?
     private var logWindow: LogWindowController?
+    private var agentsWindow: AgentsWindowController?
+    private var autopilotHolding = false
+    private var tickScheduled = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Paths.ensure()
@@ -42,6 +46,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(forName: .init("com.vibewake.showLogs"), object: nil, queue: .main) { [weak self] _ in
             self?.showLogs()
         }
+        DistributedNotificationCenter.default().addObserver(forName: .init("com.vibewake.showAgents"), object: nil, queue: .main) { [weak self] _ in
+            self?.showAgents()
+        }
+        DistributedNotificationCenter.default().addObserver(forName: .init("com.vibewake.autopilotTick"), object: nil, queue: .main) { [weak self] _ in
+            self?.autopilot.tick()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
         tick()
     }
@@ -56,11 +66,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func tick() {
         let now = Date().timeIntervalSince1970
         items = monitor.evaluate()
-        if !items.isEmpty { lastActiveAt = now }
         logSessionChanges()
+        autopilot.tick()
         checkLid()
 
-        let working = !items.isEmpty || now - lastActiveAt < Self.gracePeriod
+        // Pending autopilot work (continue after a usage limit, a nudge, a queued prompt) needs the Mac awake too.
+        let autopilotWaiting = !autopilot.keepAwakeReasons.isEmpty
+        if autopilotWaiting != autopilotHolding {
+            autopilotHolding = autopilotWaiting
+            Log.write("state", autopilotWaiting ? "Autopilot has pending work → keeping Mac awake: " + autopilot.keepAwakeReasons.joined(separator: "; ")
+                                                : "Autopilot has no pending work")
+        }
+        if !items.isEmpty || autopilotWaiting { lastActiveAt = now }
+
+        let working = !items.isEmpty || autopilotWaiting || now - lastActiveAt < Self.gracePeriod
         var override = false
         var batteryInfo = ""
         if working, lidClosed, let b = SleepController.battery,
@@ -76,7 +95,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let shouldHold = working && !paused && !lowBatteryOverride
         if shouldHold && !sleep.isHolding {
-            Log.write("state", "ACTIVE — \(items.count) session\(items.count == 1 ? "" : "s") working → keeping Mac awake")
+            Log.write("state", items.isEmpty && autopilotWaiting ? "ACTIVE — autopilot waiting → keeping Mac awake"
+                               : "ACTIVE — \(items.count) session\(items.count == 1 ? "" : "s") working → keeping Mac awake")
             sleep.hold(reason: "AI agent working")
         } else if !shouldHold && sleep.isHolding {
             Log.write("state", paused ? "PAUSED — normal sleep rules apply"
@@ -181,13 +201,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if paused { header = "Paused — normal sleep rules apply" }
         else if lowBatteryOverride { header = "Battery low — allowing sleep" }
         else if !items.isEmpty { header = "Keeping awake: \(items.count) active session\(items.count == 1 ? "" : "s")" }
+        else if !autopilot.keepAwakeReasons.isEmpty { header = "Keeping awake for autopilot" }
         else if sleep.isHolding { header = "Winding down… (\(graceRemaining)s)" }
         else { header = "Idle — Mac can sleep normally" }
         menu.addItem(disabled(header))
 
+        let titles = Dictionary(autopilot.sessions.compactMap { s in s.title.map { (s.id, $0) } }, uniquingKeysWith: { a, _ in a })
         for item in items {
             var parts = [item.agent]
             if let p = item.project { parts.append(p) }
+            if let t = titles[item.id] { parts.append("“\(t.count > 40 ? t.prefix(39) + "…" : t)”") }
             parts.append(Self.elapsed(since: item.since))
             var line = parts.joined(separator: " · ")
             var extras: [String] = []
@@ -198,6 +221,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let mi = disabled("    " + line)
             menu.addItem(mi)
         }
+        for reason in autopilot.keepAwakeReasons { menu.addItem(disabled("    " + reason)) }
 
         menu.addItem(.separator())
         let pause = NSMenuItem(title: "Pause (allow sleep)", action: #selector(togglePause), keyEquivalent: "")
@@ -220,6 +244,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(login)
 
         menu.addItem(.separator())
+        let agents = action("Show Agents…", #selector(showAgents))
+        agents.keyEquivalent = "a"
+        menu.addItem(agents)
         let logs = action("Show Logs…", #selector(showLogs))
         logs.keyEquivalent = "l"
         menu.addItem(logs)
@@ -292,6 +319,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         logWindow?.show()
     }
 
+    @objc private func showAgents() {
+        if agentsWindow == nil { agentsWindow = AgentsWindowController(autopilot: autopilot) }
+        agentsWindow?.show()
+    }
+
     @objc private func openMarkers() {
         NSWorkspace.shared.open(Paths.active)
     }
@@ -311,10 +343,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let fd = open(Paths.active.path, O_EVTONLY)
         guard fd >= 0 else { return }
         let src = DispatchSource.makeFileSystemObjectSource(fileDescriptor: fd, eventMask: [.write, .rename, .delete], queue: .main)
-        src.setEventHandler { [weak self] in self?.tick() }
+        // Each hook writes a tmp file and renames it; coalesce bursts into one tick.
+        src.setEventHandler { [weak self] in self?.scheduleTick() }
         src.setCancelHandler { close(fd) }
         src.resume()
         dirWatcher = src
+    }
+
+    private func scheduleTick() {
+        guard !tickScheduled else { return }
+        tickScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+            self?.tickScheduled = false
+            self?.tick()
+        }
     }
 
     /// Make sure `disablesleep` is reset when launchd or the user stops us.

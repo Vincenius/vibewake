@@ -7,7 +7,7 @@ final class LogWindowController: NSWindowController, NSWindowDelegate, NSSearchF
         override func cancelOperation(_ sender: Any?) { close() }
     }
 
-    static let categories = ["All", "claude", "pi", "session", "state", "sleep", "system", "app"]
+    static let categories = ["All", "claude", "pi", "session", "autopilot", "state", "sleep", "system", "app"]
     private static let maxLines = 5000
 
     private let textView = NSTextView()
@@ -164,6 +164,7 @@ final class LogWindowController: NSWindowController, NSWindowDelegate, NSSearchF
         case "system": return .systemBlue
         case "session": return .systemPurple
         case "claude", "pi": return .systemTeal
+        case "autopilot": return .systemPink
         default: return .secondaryLabelColor
         }
     }

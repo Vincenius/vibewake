@@ -38,11 +38,12 @@ final class ActivityMonitor {
 
         // Group markers by agent session.
         struct Group { var agent = ""; var cwd: String?; var pid: Int32 = 0
-            var turn: Marker?; var subs: [Marker] = []; var hasPresence = false }
+            var turn: Marker?; var subs: [Marker] = []; var hasPresence = false; var transcript: String?
+            var awaitingInput = false }
         var groups: [String: Group] = [:]
 
         for (url, m) in markers {
-            guard table[m.pid] != nil || ProcessTree.isAlive(m.pid) else {
+            guard ProcessTree.isAlive(m, in: table) else {
                 MarkerStore.remove(url) // agent process is gone → stale marker
                 if m.kind != "session" {
                     Log.write("session", "\(m.agent) process \(m.pid) exited without finishing its \(m.kind) — marker removed")
@@ -56,7 +57,7 @@ final class ActivityMonitor {
             switch m.kind {
             case "turn": g.turn = m
             case "subagent": g.subs.append(m)
-            default: g.hasPresence = true
+            default: g.hasPresence = true; g.transcript = m.transcript; g.awaitingInput = m.awaitingInputAt != nil
             }
             groups[key] = g
         }
@@ -69,7 +70,10 @@ final class ActivityMonitor {
             let shellProcs = ProcessTree.longRunningShellChildren(of: g.pid, in: table, minAge: config.minShellAge)
             let shells = shellProcs.count
             let fresh: (Marker) -> Bool = { now - $0.touchedAt < self.config.staleAfter || shells > 0 }
-            let turnActive = g.turn.map(fresh) ?? false
+            // A turn interrupted with Esc never fires Stop; the transcript says so.
+            // A turn waiting for a permission answer does no work until the user is back.
+            let turnActive = g.turn.map { fresh($0) && !g.awaitingInput
+                && !SessionInbox.lastTurnInterrupted(transcript: g.transcript, after: $0.startedAt) } ?? false
             let subs = g.subs.filter(fresh)
 
             guard turnActive || !subs.isEmpty || shells > 0 else { continue }

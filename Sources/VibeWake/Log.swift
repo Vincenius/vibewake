@@ -16,20 +16,27 @@ enum Log {
     static func write(_ category: String, _ message: String) {
         Paths.ensure()
         let line = "\(formatter.string(from: Date()))  [\(category)]  \(message)\n"
-        rotateIfNeeded()
-        // O_APPEND keeps concurrent writers (app + hooks) from clobbering each other.
-        let fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+        // O_APPEND keeps concurrent writers (app + hooks) from clobbering each other;
+        // the lock makes sure only one of them rotates.
+        var fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
         guard fd >= 0 else { return }
+        flock(fd, LOCK_EX)
+        if rotateIfNeeded(fd) {
+            close(fd)
+            fd = open(url.path, O_WRONLY | O_APPEND | O_CREAT, 0o644)
+            guard fd >= 0 else { return }
+            flock(fd, LOCK_EX)
+        }
         _ = line.withCString { Darwin.write(fd, $0, strlen($0)) }
         close(fd)
     }
 
-    private static func rotateIfNeeded() {
-        guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size] as? Int,
-              size > maxBytes else { return }
-        let old = url.appendingPathExtension("1")
-        try? FileManager.default.removeItem(at: old)
-        try? FileManager.default.moveItem(at: url, to: old)
+    /// Rotate if the file behind `fd` is too big and still the current log (another writer may have rotated it).
+    private static func rotateIfNeeded(_ fd: Int32) -> Bool {
+        var open = stat(), current = stat()
+        guard fstat(fd, &open) == 0, open.st_size > maxBytes,
+              stat(url.path, &current) == 0, current.st_ino == open.st_ino else { return open.st_size > maxBytes }
+        return rename(url.path, url.appendingPathExtension("1").path) == 0
     }
 
     /// The last `count` lines, newest first.

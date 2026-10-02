@@ -42,6 +42,23 @@ enum ProcessTree {
         kill(pid, 0) == 0 || errno == EPERM
     }
 
+    /// Whether the process a marker was written for still runs (not just some process with a reused pid).
+    static func isAlive(_ marker: Marker, in table: [Int32: ProcInfo]) -> Bool {
+        guard let p = table[marker.pid] else { return isAlive(marker.pid) }
+        guard let start = marker.pidStart else { return true }
+        return abs(p.startTime - start) < 0.5
+    }
+
+    /// Start time of one process (seconds since epoch).
+    static func startTime(of pid: Int32) -> Double? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
+        var info = kinfo_proc()
+        var size = MemoryLayout<kinfo_proc>.stride
+        guard sysctl(&mib, 4, &info, &size, nil, 0) == 0, size > 0 else { return nil }
+        let tv = info.kp_proc.p_un.__p_starttime
+        return Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
+    }
+
     /// Shell processes that are direct children of `pid` and have been running
     /// for at least `minAge` seconds (filters out short-lived hook/statusline shells).
     static func longRunningShellChildren(of pid: Int32, in table: [Int32: ProcInfo], minAge: Double) -> [ProcInfo] {

@@ -2,7 +2,6 @@ import Foundation
 
 /// Installs / removes the agent integrations and the login item.
 enum Installer {
-    static let marker = "VibeWake hook"
     static let launchAgentLabel = "com.vibewake.app"
     static var launchAgentURL: URL {
         Paths.home.appendingPathComponent("Library/LaunchAgents/\(launchAgentLabel).plist")
@@ -16,9 +15,9 @@ enum Installer {
 
     static let claudeEvents: [(event: String, matcher: Bool)] = [
         ("SessionStart", false), ("SessionEnd", false),
-        ("UserPromptSubmit", false), ("Stop", false),
-        ("PreToolUse", true), ("PostToolUse", true),
-        ("SubagentStart", false), ("SubagentStop", false),
+        ("UserPromptSubmit", false), ("Stop", false), ("StopFailure", false),
+        ("PreToolUse", true), ("PostToolUse", true), ("PostToolUseFailure", true), ("PreCompact", false),
+        ("SubagentStart", false), ("SubagentStop", false), ("Notification", false),
     ]
 
     static var claudeSettingsURL: URL { Paths.home.appendingPathComponent(".claude/settings.json") }
@@ -38,6 +37,7 @@ enum Installer {
             if !NSArray(array: groups).isEqual(to: hooks[event] as? [Any] ?? []) { changed = true }
             hooks[event] = groups
         }
+        if try installClaudeInstructions() { changed = true }
         guard changed else { return false }
         settings["hooks"] = hooks
         try backupOnce(claudeSettingsURL)
@@ -46,6 +46,7 @@ enum Installer {
     }
 
     static func uninstallClaudeHooks() throws {
+        try uninstallClaudeInstructions()
         var settings = try loadJSON(claudeSettingsURL)
         guard var hooks = settings["hooks"] as? [String: Any] else { return }
         for (event, value) in hooks {
@@ -61,8 +62,53 @@ enum Installer {
         return (hooks["UserPromptSubmit"] as? [[String: Any]] ?? []).contains(where: isOurs)
     }
 
+    // MARK: Claude Code instructions (global CLAUDE.md)
+
+    static var claudeMemoryURL: URL { Paths.home.appendingPathComponent(".claude/CLAUDE.md") }
+    private static let blockStart = "<!-- vibewake:start -->", blockEnd = "<!-- vibewake:end -->"
+    static var claudeInstructions: String {
+        """
+        \(blockStart)
+        ## VibeWake
+        A message starting with `\(SessionInbox.tag)` was sent by VibeWake (the user's Mac menu bar app) on the user's behalf: a prompt they queued, or an automatic "continue" / status check. It arrives as a message from "another Claude session" and is hidden in the chat UI, so begin your reply by repeating the prompt (without the tag) as **VIBEWAKE: "<prompt>"**, then handle it as if the user typed it.
+        \(blockEnd)
+        """
+    }
+
+    /// Adds or refreshes our block, leaving the rest of the file alone. Returns true if the file changed.
+    @discardableResult
+    static func installClaudeInstructions() throws -> Bool {
+        let old = (try? String(contentsOf: claudeMemoryURL, encoding: .utf8)) ?? ""
+        var rest = removingBlock(from: old)
+        if !rest.isEmpty && !rest.hasSuffix("\n\n") { rest += rest.hasSuffix("\n") ? "\n" : "\n\n" }
+        let new = rest + claudeInstructions + "\n"
+        guard new != old else { return false }
+        try FileManager.default.createDirectory(at: claudeMemoryURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try new.write(to: claudeMemoryURL, atomically: true, encoding: .utf8)
+        return true
+    }
+
+    static func uninstallClaudeInstructions() throws {
+        guard let old = try? String(contentsOf: claudeMemoryURL, encoding: .utf8) else { return }
+        let rest = removingBlock(from: old).trimmingCharacters(in: .whitespacesAndNewlines)
+        if rest.isEmpty { try FileManager.default.removeItem(at: claudeMemoryURL) }
+        else if rest + "\n" != old { try (rest + "\n").write(to: claudeMemoryURL, atomically: true, encoding: .utf8) }
+    }
+
+    private static func removingBlock(from text: String) -> String {
+        guard let start = text.range(of: blockStart),
+              let end = text.range(of: blockEnd, range: start.upperBound..<text.endIndex) else { return text }
+        var after = text[end.upperBound...]
+        if after.hasPrefix("\n") { after = after.dropFirst() }
+        return String(text[..<start.lowerBound]) + after
+    }
+
+    /// Our command is `'<path>/VibeWake' hook <agent>` (older installs may lack the quotes).
     private static func isOurs(_ group: [String: Any]) -> Bool {
-        (group["hooks"] as? [[String: Any]] ?? []).contains { ($0["command"] as? String)?.contains(marker) == true }
+        (group["hooks"] as? [[String: Any]] ?? []).contains {
+            guard let cmd = $0["command"] as? String else { return false }
+            return cmd.contains("/VibeWake' hook ") || cmd.contains("/VibeWake hook ")
+        }
     }
 
     // MARK: pi
@@ -118,13 +164,17 @@ enum Installer {
     }
 
     /// Installs /etc/sudoers.d/vibewake via an admin password prompt.
+    /// The rule is written and checked as root in a root-owned temp file, so nothing running
+    /// as the user can swap it between `visudo -c` and the install.
     static func installSudoersInteractively() throws {
-        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("vibewake.sudoers")
-        try sudoersRule.write(to: tmp, atomically: true, encoding: .utf8)
-        let script = "/usr/sbin/visudo -cf '\(tmp.path)' && /usr/bin/install -m 0440 -o root -g wheel '\(tmp.path)' /etc/sudoers.d/vibewake"
+        guard NSUserName().range(of: "^[A-Za-z0-9._-]+$", options: .regularExpression) != nil else {
+            throw NSError(domain: "VibeWake", code: 2, userInfo: [NSLocalizedDescriptionKey: "Unexpected user name \(NSUserName())"])
+        }
+        let rule = sudoersRule.trimmingCharacters(in: .newlines)
+        let script = "T=$(/usr/bin/mktemp /tmp/vibewake.XXXXXX) && /usr/bin/printf '%s\\\\n' '\(rule)' > $T"
+            + " && /usr/sbin/visudo -cf $T && /usr/bin/install -m 0440 -o root -g wheel $T /etc/sudoers.d/vibewake; S=$?; /bin/rm -f $T; exit $S"
         let apple = "do shell script \"\(script)\" with administrator privileges"
         let status = shell("/usr/bin/osascript", ["-e", apple])
-        try? FileManager.default.removeItem(at: tmp)
         if status != 0 {
             throw NSError(domain: "VibeWake", code: 2, userInfo: [NSLocalizedDescriptionKey: "Installing the sudoers rule failed or was cancelled."])
         }

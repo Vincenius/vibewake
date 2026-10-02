@@ -12,10 +12,26 @@ struct Marker: Codable {
     var session: String
     var kind: String
     var pid: Int32
+    /// Start time of `pid`, so a reused pid isn't mistaken for the agent (nil for pi markers).
+    var pidStart: Double?
     var cwd: String?
     var startedAt: Double
     var touchedAt: Double
     var label: String?
+    // Session markers only (Claude Code): how to reach and describe the chat.
+    /// Inbox socket of the session (CLAUDE_CODE_MESSAGING_SOCKET) and its token.
+    var socket: String?
+    var token: String?
+    var transcript: String?
+    /// Custom title reported by SessionStart; the AI title is read from the transcript.
+    var title: String?
+    /// Set by StopFailure(rate_limit): when the usage limit resets (epoch seconds).
+    var limitResetAt: Double?
+    /// Last time a turn ended normally (Stop).
+    var lastStopAt: Double?
+    /// Set by a Notification hook (permission prompt, question): the turn waits for the user.
+    /// Cleared by the main agent's next sign of life.
+    var awaitingInputAt: Double?
 }
 
 enum Paths {
@@ -23,13 +39,25 @@ enum Paths {
     static let root = home.appendingPathComponent(".vibewake")
     static let active = root.appendingPathComponent("active")
     static let state = root.appendingPathComponent("state")
+    static let queue = root.appendingPathComponent("queue")
     /// Present while VibeWake has set `pmset disablesleep 1`, so we only undo what we did.
     static let disableSleepOwned = state.appendingPathComponent("disablesleep-owned")
 
     static func ensure() {
-        for dir in [active, state] {
+        for dir in [active, state, queue] {
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
+    }
+}
+
+/// An exclusive lock between processes (app, hooks, CLI) for read-modify-write of shared files.
+enum FileLock {
+    static func with<T>(_ name: String, _ body: () throws -> T) rethrows -> T {
+        Paths.ensure()
+        let fd = open(Paths.state.appendingPathComponent(name).path, O_RDWR | O_CREAT, 0o600)
+        if fd >= 0 { flock(fd, LOCK_EX) }
+        defer { if fd >= 0 { close(fd) } } // closing releases the lock
+        return try body()
     }
 }
 
@@ -51,23 +79,42 @@ enum MarkerStore {
         return try? JSONDecoder().decode(Marker.self, from: data)
     }
 
-    /// Create or refresh a marker, preserving its original start time.
-    static func upsert(_ url: URL, agent: String, session: String, kind: String, pid: Int32, cwd: String?, label: String? = nil) {
-        Paths.ensure()
-        let now = Date().timeIntervalSince1970
-        let existing = read(url)
-        let marker = Marker(agent: agent, session: session, kind: kind, pid: pid,
-                            cwd: cwd ?? existing?.cwd,
-                            startedAt: existing?.startedAt ?? now, touchedAt: now,
-                            label: label ?? existing?.label)
-        guard let data = try? JSONEncoder().encode(marker) else { return }
-        let tmp = url.appendingPathExtension("tmp\(getpid())")
-        do {
-            try data.write(to: tmp)
-            _ = rename(tmp.path, url.path)
-        } catch {
-            try? FileManager.default.removeItem(at: tmp)
+    /// Create or refresh a marker, preserving its original start time and extra fields.
+    static func upsert(_ url: URL, agent: String, session: String, kind: String, pid: Int32, cwd: String?, label: String? = nil,
+                       update: ((inout Marker) -> Void)? = nil) {
+        FileLock.with("markers.lock") {
+            let now = Date().timeIntervalSince1970
+            var marker = read(url) ?? Marker(agent: agent, session: session, kind: kind, pid: pid, cwd: nil, startedAt: now, touchedAt: now)
+            if marker.pid != pid || marker.pidStart == nil { marker.pidStart = ProcessTree.startTime(of: pid) }
+            marker.pid = pid
+            marker.touchedAt = now
+            if let cwd { marker.cwd = cwd }
+            if let label { marker.label = label }
+            update?(&marker)
+            write(marker, to: url)
         }
+    }
+
+    /// Change fields of an existing marker without refreshing its heartbeat.
+    static func modify(_ url: URL, _ update: (inout Marker) -> Void) {
+        FileLock.with("markers.lock") {
+            guard var marker = read(url) else { return }
+            update(&marker)
+            write(marker, to: url)
+        }
+    }
+
+    /// Atomic write, readable only by the user (session markers hold the inbox token).
+    static func writeAtomically(_ data: Data, to url: URL) {
+        let tmp = url.appendingPathExtension("tmp\(getpid())")
+        if FileManager.default.createFile(atPath: tmp.path, contents: data, attributes: [.posixPermissions: 0o600]) {
+            if rename(tmp.path, url.path) != 0 { try? FileManager.default.removeItem(at: tmp) }
+        }
+    }
+
+    private static func write(_ marker: Marker, to url: URL) {
+        guard let data = try? JSONEncoder().encode(marker) else { return }
+        writeAtomically(data, to: url)
     }
 
     static func remove(_ url: URL) {
