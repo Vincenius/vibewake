@@ -27,6 +27,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var agentsWindow: AgentsWindowController?
     private var autopilotHolding = false
     private var tickScheduled = false
+    private lazy var remote = RemoteBridge(autopilot: autopilot)
+    /// After a wake, stay up until the relay has handed over pending commands (or this deadline).
+    private var checkIn: (deadline: Double, syncedAt: Double?, scheduled: Bool)?
+    /// When our scheduled wake is due, so a wake around then counts as "woke to check in".
+    private var pendingWakeAt: Double?
+    /// On battery below this, don't wake up just to check in.
+    static let checkInMinBattery = 20
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Paths.ensure()
@@ -52,6 +59,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         DistributedNotificationCenter.default().addObserver(forName: .init("com.vibewake.autopilotTick"), object: nil, queue: .main) { [weak self] _ in
             self?.autopilot.tick()
         }
+        remote.isPaused = { [weak self] in self?.paused ?? false }
+        remote.setPaused = { [weak self] p in
+            guard let self, p != self.paused else { return }
+            self.togglePause()
+        }
+        remote.client.onSynced = { [weak self] in
+            guard let self, self.checkIn != nil else { return }
+            self.checkIn?.syncedAt = Date().timeIntervalSince1970
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
         tick()
     }
@@ -68,10 +84,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         items = monitor.evaluate()
         logSessionChanges()
         autopilot.tick()
+        remote.update()
         checkLid()
+        if finishCheckIn(now: now) { return }
 
         // Pending autopilot work (continue after a usage limit, a nudge, a queued prompt) needs the Mac awake too.
-        let autopilotWaiting = !autopilot.keepAwakeReasons.isEmpty
+        let autopilotWaiting = !autopilot.keepAwakeReasons.isEmpty || checkIn != nil
         if autopilotWaiting != autopilotHolding {
             autopilotHolding = autopilotWaiting
             Log.write("state", autopilotWaiting ? "Autopilot has pending work → keeping Mac awake: " + autopilot.keepAwakeReasons.joined(separator: "; ")
@@ -105,6 +123,47 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             sleep.release(sleepIfLidClosed: true)
         }
         updateIcon()
+    }
+
+    /// End the check-in once commands are handed over (plus a moment for them to start work).
+    /// Returns true when it put the Mac back to sleep.
+    private func finishCheckIn(now: Double) -> Bool {
+        guard let c = checkIn else { return false }
+        let synced = c.syncedAt.map { now - $0 > 10 } ?? false
+        guard synced || now > c.deadline else { return false }
+        checkIn = nil
+        let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+        Log.write("remote", synced ? "Check-in done" : "Check-in timed out (server unreachable?)")
+        // Woke only to check in, nothing came up, and nobody is using the Mac: sleep right away.
+        guard c.scheduled, items.isEmpty, autopilot.keepAwakeReasons.isEmpty, idle > 120 else { return false }
+        if sleep.isHolding { sleep.release(sleepIfLidClosed: false) }
+        lastActiveAt = 0
+        sleep.sleepNow()
+        return true
+    }
+
+    /// Before sleeping: wake up again in a while to pick up prompts sent from the phone.
+    private func scheduleCheckInWake() {
+        guard remote.client.config != nil else { return }
+        let minutes = autopilot.settings.wakeIntervalMinutes
+        var next: Double?
+        if minutes > 0, !(SleepController.battery.map { $0.onBattery && $0.percent < Self.checkInMinBattery } ?? false) {
+            let at = Date().addingTimeInterval(minutes * 60)
+            if sleep.scheduleWake(at: at) { next = at.timeIntervalSince1970 }
+        }
+        pendingWakeAt = next
+        remote.client.sendSleeping(nextWakeAt: next)
+    }
+
+    private func startCheckIn() {
+        let now = Date().timeIntervalSince1970
+        let scheduled = pendingWakeAt.map { abs(now - $0) < 120 } ?? false
+        pendingWakeAt = nil
+        sleep.cancelWake() // woke early (or on time): don't wake again for that one
+        guard remote.client.config != nil else { return }
+        if scheduled { Log.write("remote", "Woke up to check in with the phone app") }
+        checkIn = (deadline: now + 60, syncedAt: nil, scheduled: scheduled)
+        remote.client.reconnectNow()
     }
 
     private func describe(_ item: ActiveItem) -> String {
@@ -154,9 +213,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         nc.addObserver(forName: NSWorkspace.willSleepNotification, object: nil, queue: .main) { [weak self] _ in
             guard let self else { return }
             Log.write("system", "Mac is going to SLEEP" + (self.items.isEmpty ? "" : " (with \(self.items.count) session(s) still marked active)"))
+            self.scheduleCheckInWake()
         }
         nc.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
             Log.write("system", "Mac WOKE UP")
+            self?.startCheckIn()
             self?.tick()
         }
         nc.addObserver(forName: NSWorkspace.screensDidSleepNotification, object: nil, queue: .main) { _ in
@@ -230,11 +291,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(pause)
 
         menu.addItem(.separator())
-        if lidSupport {
+        if lidSupport && (remote.client.config == nil || sleep.wakeSupportAvailable) {
             menu.addItem(disabled("Lid-closed support: ✓"))
         } else {
-            menu.addItem(action("Enable Lid-Closed Support…", #selector(installSudoers)))
+            menu.addItem(action(lidSupport ? "Enable Scheduled Wake (for the phone app)…" : "Enable Lid-Closed Support…", #selector(installSudoers)))
         }
+        menu.addItem(disabled("Phone app: " + remoteStatusText))
         let claude = Installer.claudeHooksInstalled ? "✓" : "–"
         let pi = Installer.piExtensionInstalled ? "✓" : "–"
         menu.addItem(disabled("Integrations: Claude Code \(claude)  pi \(pi)"))
@@ -252,6 +314,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(logs)
         menu.addItem(action("Open Marker Folder", #selector(openMarkers)))
         menu.addItem(NSMenuItem(title: "Quit VibeWake", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    private var remoteStatusText: String {
+        switch remote.client.status {
+        case .off: return "not set up (Agents window → Remote)"
+        case .connecting: return "connecting…"
+        case .connected: return "connected" + (autopilot.settings.remoteControl ? "" : " (control off)")
+        case .failed(let why): return "offline — \(why.prefix(50))"
+        }
     }
 
     private func disabled(_ title: String) -> NSMenuItem {
@@ -320,7 +391,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showAgents() {
-        if agentsWindow == nil { agentsWindow = AgentsWindowController(autopilot: autopilot) }
+        if agentsWindow == nil { agentsWindow = AgentsWindowController(autopilot: autopilot, remote: remote) }
         agentsWindow?.show()
     }
 

@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">VibeWake</string>
+    <string name="channel_events">Agent updates</string>
+    <string name="channel_events_desc">A chat finished, hit a usage limit, or waits for you</string>
+</resources>

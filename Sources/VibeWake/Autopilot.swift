@@ -12,6 +12,19 @@ struct AutopilotSettings: Codable, Equatable {
     var statusPrompt = "what is the status?"
     /// URL scheme of the editor running the Claude Code extension (vscode, cursor, …).
     var editorScheme = "vscode"
+    // Remote control (phone app via the relay server, see RemoteClient).
+    /// Off switch for everything the phone can do; the Mac still reports its state.
+    var remoteControl = true
+    /// While asleep, wake every this many minutes to pick up prompts from the phone (0 = never).
+    var wakeIntervalMinutes: Double = 15
+    /// Where chats the phone starts run: "auto" (editor tab if someone could see it, else headless), "headless", "editor".
+    var remoteNewChats = "auto"
+    /// --permission-mode for chats the phone starts while nobody is at the Mac.
+    var headlessPermissionMode = "acceptEdits"
+    /// Path to the `claude` binary for those chats; empty = find it.
+    var claudePath = ""
+    /// Extra project folders the phone may start chats in (besides folders of recent chats).
+    var remoteProjects: [String] = []
 
     static var url: URL { Paths.state.appendingPathComponent("settings.json") }
 
@@ -28,6 +41,12 @@ struct AutopilotSettings: Codable, Equatable {
         if let v = obj["continuePrompt"] as? String, !v.isEmpty { s.continuePrompt = v }
         if let v = obj["statusPrompt"] as? String, !v.isEmpty { s.statusPrompt = v }
         if let v = obj["editorScheme"] as? String, !v.isEmpty { s.editorScheme = v }
+        if let v = obj["remoteControl"] as? Bool { s.remoteControl = v }
+        if let v = obj["wakeIntervalMinutes"] as? Double, v >= 0 { s.wakeIntervalMinutes = v == 0 ? 0 : max(5, v) }
+        if let v = obj["remoteNewChats"] as? String, ["auto", "headless", "editor"].contains(v) { s.remoteNewChats = v }
+        if let v = obj["headlessPermissionMode"] as? String, !v.isEmpty { s.headlessPermissionMode = v }
+        if let v = obj["claudePath"] as? String { s.claudePath = v }
+        if let v = obj["remoteProjects"] as? [String] { s.remoteProjects = v }
         return s
     }
 
@@ -102,12 +121,18 @@ final class Autopilot: ObservableObject {
     @Published private(set) var blocked: [String: (reason: String, at: Double)] = [:]
     /// A "new chat" prompt waiting for the new VS Code tab to register.
     /// The queue item stays in its queue until it has been handed over, so a failure doesn't lose it.
-    private struct PendingNewChat { let item: QueuedPrompt; let cwd: String; let openedAt: Double; let from: String }
+    /// `from` is the chat whose queue holds the item; nil for a chat the phone asked for, which
+    /// runs `fallback` (headless) instead of a pre-filled tab if the tab doesn't register.
+    private struct PendingNewChat { let item: QueuedPrompt; let cwd: String; let openedAt: Double; let from: String?
+        var fallback: ((_ cwd: String, _ text: String) -> Void)? = nil }
     private var pendingNewChat: PendingNewChat?
     /// Why the Mac should stay awake for the autopilot (a continue, nudge or queued prompt is pending).
     private(set) var keepAwakeReasons: [String] = []
 
     private var lastPrune: Double = 0
+    /// Chats run with `claude -p`: their queue is run by HeadlessRunner with --resume once the
+    /// process exits; sending to the inbox of a process about to exit could lose the prompt.
+    var isHeadless: (String) -> Bool = { _ in false }
 
     init() {
         if !FileManager.default.fileExists(atPath: AutopilotSettings.url.path) { settings.save() }
@@ -218,7 +243,8 @@ final class Autopilot: ObservableObject {
         guard now - lastPrune > 60 else { return }
         lastPrune = now
         let files = (try? FileManager.default.contentsOfDirectory(atPath: Paths.queue.path)) ?? []
-        let liveFiles = Set(live.keys.map { PromptQueue.url(for: $0).lastPathComponent })
+        // Chats the phone ran headless keep their queue after the process exits (HeadlessRunner resumes them).
+        let liveFiles = Set((Array(live.keys) + HeadlessRunner.knownKeys()).map { PromptQueue.url(for: $0).lastPathComponent })
         for f in files where f.hasSuffix(".json") && !liveFiles.contains(f) {
             let url = Paths.queue.appendingPathComponent(f)
             let items = (try? Data(contentsOf: url)).flatMap { try? JSONDecoder().decode([QueuedPrompt].self, from: $0) } ?? []
@@ -296,6 +322,7 @@ final class Autopilot: ObservableObject {
         // Idle: run the queue.
         guard let item = s.queue.first else { return nil }
         guard settings.queueEnabled else { return "queue paused" }
+        if isHeadless(s.id) { return "next prompt once this run ends" }
         if let stop = s.presence?.lastStopAt, now - stop < Self.idleSettle { return "next prompt in a moment" }
 
         switch item.mode {
@@ -344,20 +371,39 @@ final class Autopilot: ObservableObject {
         if let fresh = list.first(where: { $0.id != p.from && $0.cwd == p.cwd && $0.canReceive
                                             && ($0.presence?.startedAt ?? 0) >= p.openedAt - 2 }) {
             pendingNewChat = nil
+            guard let from = p.from else {
+                if !deliver(p.item.text, to: fresh, now: now) { p.fallback?(p.cwd, p.item.text) }
+                return
+            }
             if deliver(p.item.text, to: fresh, now: now) {
-                PromptQueue.remove(p.from, id: p.item.id)
+                PromptQueue.remove(from, id: p.item.id)
             } else {
-                blocked[p.from] = ("the new chat could not receive the prompt", now) // don't open tab after tab
+                blocked[from] = ("the new chat could not receive the prompt", now) // don't open tab after tab
             }
         } else if now - p.openedAt > Self.newChatTimeout {
             pendingNewChat = nil
+            guard let from = p.from else {
+                Log.write("autopilot", "new chat did not register within \(Int(Self.newChatTimeout))s — running the prompt headless instead")
+                p.fallback?(p.cwd, p.item.text)
+                return
+            }
             if openEditor(cwd: p.cwd, prefill: p.item.text) {
-                PromptQueue.remove(p.from, id: p.item.id)
+                PromptQueue.remove(from, id: p.item.id)
                 Log.write("autopilot", "new chat did not register within \(Int(Self.newChatTimeout))s — opened it with the prompt pre-filled instead")
             } else {
-                failNewChat(from: p.from, now: now)
+                failNewChat(from: from, now: now)
             }
         }
+    }
+
+    /// Open a new editor chat for the phone and hand it `text`; `fallback` runs if that doesn't work out.
+    /// Returns false when no tab could be opened at all (or another new chat is still opening).
+    func openRemoteChat(cwd: String, text: String, fallback: @escaping (_ cwd: String, _ text: String) -> Void) -> Bool {
+        guard pendingNewChat == nil, openEditor(cwd: cwd, prefill: nil) else { return false }
+        Log.write("autopilot", "opening a new chat in \((cwd as NSString).lastPathComponent) for “\(Self.short(text))” (from phone)")
+        pendingNewChat = PendingNewChat(item: QueuedPrompt(text: text, mode: .newChat), cwd: cwd,
+                                        openedAt: Date().timeIntervalSince1970, from: nil, fallback: fallback)
+        return true
     }
 
     @discardableResult

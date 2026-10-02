@@ -16,8 +16,25 @@ final class SleepController {
     static let sudo = "/usr/bin/sudo"
 
     /// Whether the sudoers rule for `pmset disablesleep` is installed.
-    var lidSupportAvailable: Bool {
-        run(Self.sudo, ["-n", "-l", Self.pmset, "-a", "disablesleep", "1"]) == 0
+    var lidSupportAvailable: Bool { Self.passwordless("pmset -a disablesleep 1") }
+
+    /// Whether the sudoers rule also allows `pmset schedule wake` (wake to check in with the phone).
+    var wakeSupportAvailable: Bool { Self.passwordless("pmset schedule wake") }
+
+    /// Whether `sudo -n -l` lists `command` as allowed without a password. (`sudo -n -l <command>`
+    /// isn't enough: for an admin it succeeds for anything, though running it would ask for a password.)
+    private static func passwordless(_ command: String) -> Bool {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: sudo)
+        p.arguments = ["-n", "-l"]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return false }
+        let text = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+        p.waitUntilExit()
+        return text.split(separator: "\n").contains { $0.contains("NOPASSWD:") && $0.contains(command) }
     }
 
     /// Undo a `disablesleep 1` left behind by a previous run (crash, kill -9).
@@ -81,6 +98,53 @@ final class SleepController {
         } else {
             Log.write("sleep", "FAILED to restore lid-close sleep (pmset exit \(status)) — run: sudo pmset -a disablesleep 0")
         }
+    }
+
+    // MARK: - Scheduled wake
+
+    private static let wakeFormat: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.dateFormat = "MM/dd/yy HH:mm:ss"
+        return f
+    }()
+
+    /// The wake we scheduled, if it's still ahead.
+    var scheduledWake: Date? {
+        guard let s = try? String(contentsOf: Paths.scheduledWake, encoding: .utf8),
+              let d = Self.wakeFormat.date(from: s.trimmingCharacters(in: .whitespacesAndNewlines)) else { return nil }
+        return d > Date() ? d : nil
+    }
+
+    /// Replace our scheduled wake (only ours: other wakes in `pmset -g sched` are left alone).
+    @discardableResult
+    func scheduleWake(at date: Date) -> Bool {
+        cancelWake()
+        let s = Self.wakeFormat.string(from: date)
+        guard run(Self.sudo, ["-n", Self.pmset, "schedule", "wake", s]) == 0 else {
+            Log.write("sleep", "Could not schedule a wake (sudoers rule missing? use “Enable Lid-Closed Support…”)")
+            return false
+        }
+        Paths.ensure()
+        try? s.write(to: Paths.scheduledWake, atomically: true, encoding: .utf8)
+        Log.write("sleep", "Scheduled a wake at \(s) to check for prompts from the phone")
+        return true
+    }
+
+    func cancelWake() {
+        guard let s = try? String(contentsOf: Paths.scheduledWake, encoding: .utf8) else { return }
+        try? FileManager.default.removeItem(at: Paths.scheduledWake)
+        let date = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        // A wake in the past has already been removed by the system.
+        if let d = Self.wakeFormat.date(from: date), d > Date() {
+            run(Self.sudo, ["-n", Self.pmset, "schedule", "cancel", "wake", date])
+        }
+    }
+
+    /// Back to sleep after a check-in found nothing to do (lid open: the system would idle for minutes first).
+    func sleepNow() {
+        Log.write("sleep", "Nothing to do after the check-in → back to sleep")
+        run(Self.pmset, ["sleepnow"])
     }
 
     // MARK: - System state

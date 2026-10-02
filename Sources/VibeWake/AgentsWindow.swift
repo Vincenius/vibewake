@@ -1,4 +1,5 @@
 import AppKit
+import CoreImage.CIFilterBuiltins
 import SwiftUI
 
 /// Floating window listing agent chats, their autopilot status and prompt queues.
@@ -7,7 +8,7 @@ final class AgentsWindowController: NSWindowController, NSWindowDelegate {
         override func cancelOperation(_ sender: Any?) { close() }
     }
 
-    init(autopilot: Autopilot) {
+    init(autopilot: Autopilot, remote: RemoteBridge) {
         let window = EscClosableWindow(contentRect: NSRect(x: 0, y: 0, width: 920, height: 560),
                                        styleMask: [.titled, .closable, .resizable, .miniaturizable],
                                        backing: .buffered, defer: false)
@@ -15,7 +16,7 @@ final class AgentsWindowController: NSWindowController, NSWindowDelegate {
         window.minSize = NSSize(width: 680, height: 360)
         window.level = .floating
         window.isReleasedWhenClosed = false
-        window.contentViewController = NSHostingController(rootView: AgentsView(autopilot: autopilot))
+        window.contentViewController = NSHostingController(rootView: AgentsView(autopilot: autopilot, client: remote.client))
         super.init(window: window)
         window.delegate = self
     }
@@ -34,6 +35,7 @@ final class AgentsWindowController: NSWindowController, NSWindowDelegate {
 
 private struct AgentsView: View {
     @ObservedObject var autopilot: Autopilot
+    @ObservedObject var client: RemoteClient
     @State private var selection: String?
 
     var body: some View {
@@ -63,6 +65,8 @@ private struct AgentsView: View {
             }
             Divider()
             SettingsBar(autopilot: autopilot)
+            Divider()
+            RemoteBar(autopilot: autopilot, client: client)
         }
         .onAppear { selection = selection ?? autopilot.sessions.first?.id }
     }
@@ -225,6 +229,122 @@ private struct SettingsBar: View {
         }
         .toggleStyle(.checkbox)
         .padding(.horizontal, 16).padding(.vertical, 10)
+    }
+}
+
+/// Phone app: connect this Mac to the relay server, pair a phone, and limit what it may do.
+private struct RemoteBar: View {
+    @ObservedObject var autopilot: Autopilot
+    @ObservedObject var client: RemoteClient
+    @State private var server = ""
+    @State private var setupCode = ""
+    @State private var busy = false
+    @State private var error: String?
+    @State private var pairing: (link: String, expiresAt: Double)?
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Text("Phone app").fontWeight(.medium)
+            if let config = client.config {
+                Circle().fill(statusColor).frame(width: 8, height: 8)
+                Text(statusText(config)).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                Spacer()
+                Toggle("Allow remote control", isOn: $autopilot.settings.remoteControl)
+                    .help("Off: the phone can only watch. It can't send prompts, edit queues or start chats.")
+                Picker("Wake to check in", selection: $autopilot.settings.wakeIntervalMinutes) {
+                    Text("never").tag(0.0)
+                    ForEach([5.0, 10, 15, 30, 60], id: \.self) { Text("every \(Int($0)) min").tag($0) }
+                }
+                .frame(width: 210)
+                .help("While asleep, wake this often to pick up prompts sent from the phone")
+                Button("Pair Phone…") { pair(config) }.disabled(busy)
+                Button("Disconnect") { RemoteConfig.remove(); client.reloadConfig() }
+            } else {
+                TextField("https://relay.example.com", text: $server).frame(width: 240)
+                SecureField("Setup code", text: $setupCode).frame(width: 140)
+                Button("Connect") { register() }
+                    .disabled(busy || server.isEmpty || setupCode.isEmpty)
+                if let error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(2) }
+                Spacer()
+            }
+        }
+        .toggleStyle(.checkbox)
+        .padding(.horizontal, 16).padding(.vertical, 10)
+        .sheet(isPresented: Binding(get: { pairing != nil }, set: { if !$0 { pairing = nil } })) {
+            if let p = pairing { PairSheet(link: p.link, expiresAt: p.expiresAt) { pairing = nil } }
+        }
+    }
+
+    private var statusColor: Color {
+        switch client.status {
+        case .connected: return .green
+        case .connecting: return .yellow
+        case .off, .failed: return .red
+        }
+    }
+
+    private func statusText(_ config: RemoteConfig) -> String {
+        let host = URL(string: config.serverURL)?.host ?? config.serverURL
+        switch client.status {
+        case .off: return host
+        case .connecting: return "connecting to \(host)…"
+        case .connected: return "connected to \(host)"
+        case .failed(let why): return "\(host): \(why)"
+        }
+    }
+
+    private func register() {
+        busy = true
+        error = nil
+        Task { @MainActor in
+            defer { busy = false }
+            do {
+                _ = try await RemoteConfig.register(server: server, setupCode: setupCode.trimmingCharacters(in: .whitespaces))
+                Log.write("remote", "This Mac is now registered with \(server)")
+                setupCode = ""
+                client.reloadConfig()
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    private func pair(_ config: RemoteConfig) {
+        busy = true
+        Task { @MainActor in
+            defer { busy = false }
+            do { pairing = try await config.pairingLink() }
+            catch { self.error = error.localizedDescription }
+        }
+    }
+}
+
+private struct PairSheet: View {
+    let link: String
+    let expiresAt: Double
+    let close: () -> Void
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Text("Pair your phone").font(.title3).fontWeight(.semibold)
+            Text("In the VibeWake Android app, tap “Pair” and scan this code.")
+                .foregroundStyle(.secondary)
+            if let image = qr(link) {
+                Image(nsImage: image).interpolation(.none).resizable().frame(width: 240, height: 240)
+            }
+            Text("Valid until \(Autopilot.clock(expiresAt)), once.").font(.caption).foregroundStyle(.secondary)
+            Button("Done", action: close).keyboardShortcut(.defaultAction)
+        }
+        .padding(24)
+    }
+
+    private func qr(_ text: String) -> NSImage? {
+        let f = CIFilter.qrCodeGenerator()
+        f.message = Data(text.utf8)
+        f.correctionLevel = "M"
+        guard let out = f.outputImage?.transformed(by: CGAffineTransform(scaleX: 8, y: 8)),
+              let cg = CIContext().createCGImage(out, from: out.extent) else { return nil }
+        return NSImage(cgImage: cg, size: NSSize(width: out.extent.width, height: out.extent.height))
     }
 }
 

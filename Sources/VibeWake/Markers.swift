@@ -42,6 +42,8 @@ enum Paths {
     static let queue = root.appendingPathComponent("queue")
     /// Present while VibeWake has set `pmset disablesleep 1`, so we only undo what we did.
     static let disableSleepOwned = state.appendingPathComponent("disablesleep-owned")
+    /// The `pmset schedule wake` date VibeWake set, so only that one is cancelled.
+    static let scheduledWake = state.appendingPathComponent("scheduled-wake")
 
     static func ensure() {
         for dir in [active, state, queue] {

@@ -83,6 +83,53 @@ case "send", "queue":
         exit(1)
     }
 
+case "reply":
+    // VibeWake reply <session-id-prefix|title>: Claude's last message in that chat.
+    guard args.count > 2 else { printErr("usage: VibeWake reply <session-id-prefix|title>"); exit(2) }
+    let needle = args[2].lowercased()
+    let found = Autopilot.collectSessions().filter {
+        $0.session.lowercased().hasPrefix(needle) || ($0.title?.lowercased().contains(needle) ?? false)
+    }
+    guard found.count == 1, let reply = SessionInbox.lastReply(transcript: found[0].presence?.transcript) else {
+        printErr(found.count == 1 ? "no reply in that chat yet" : "\(found.count) chats match “\(args[2])”")
+        exit(1)
+    }
+    print(reply.text)
+    exit(0)
+
+case "remote":
+    // VibeWake remote setup <server-url> <setup-code> | status | off
+    switch args.count > 2 ? args[2] : "status" {
+    case "setup":
+        guard args.count > 4 else { printErr("usage: VibeWake remote setup <server-url> <setup-code>"); exit(2) }
+        let sem = DispatchSemaphore(value: 0)
+        var code: Int32 = 0
+        Task {
+            do {
+                let c = try await RemoteConfig.register(server: args[3], setupCode: args[4])
+                print("✓ registered this Mac (\(RemoteConfig.machineName)) with \(c.serverURL)")
+                print("  Pair your phone from the Agents window (Phone app → Pair Phone…)")
+            } catch {
+                printErr("setup failed: \(error.localizedDescription)")
+                code = 1
+            }
+            sem.signal()
+        }
+        sem.wait()
+        exit(code)
+    case "off":
+        RemoteConfig.remove()
+        print("✓ remote access removed (the server still lists this Mac until you delete it there)")
+        exit(0)
+    default:
+        if let c = RemoteConfig.load() { print("server: \(c.serverURL)\nmachine: \(c.machineId) (\(RemoteConfig.machineName))") }
+        else { print("not set up — VibeWake remote setup <server-url> <setup-code>") }
+        let s = AutopilotSettings.load()
+        print("remote control: \(s.remoteControl ? "on" : "off"), wake every: \(s.wakeIntervalMinutes == 0 ? "never" : "\(Int(s.wakeIntervalMinutes)) min")")
+        print("claude binary: \(HeadlessRunner.claudeBinary(s) ?? "not found")")
+        exit(0)
+    }
+
 case "status":
     let items = ActivityMonitor().evaluate()
     print(items.isEmpty ? "idle" : "active: " + items.map { "\($0.agent)\($0.project.map { " (\($0))" } ?? "")" }.joined(separator: ", "))

@@ -9,9 +9,11 @@ APP="$DEST/VibeWake.app"
 
 ./scripts/build-app.sh
 
-# sudoers rule: only these two exact commands are allowed without a password.
-RULE="$(whoami) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
-if ! sudo -n -l /usr/bin/pmset -a disablesleep 1 >/dev/null 2>&1; then
+# sudoers rule: only these pmset commands are allowed without a password
+# (stay awake with the lid closed; schedule wakes to check in with the phone app).
+RULE="$(whoami) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1, /usr/bin/pmset schedule wake *, /usr/bin/pmset schedule cancel wake *"
+# (`sudo -l <command>` succeeds for any command for admins, so look for the NOPASSWD rule itself.)
+if ! sudo -n -l 2>/dev/null | grep -q "NOPASSWD:.*pmset schedule wake"; then
   echo "→ Installing /etc/sudoers.d/vibewake (needed to stay awake with the lid closed)"
   # Root-owned temp file, so nothing running as this user can swap it between check and install.
   TMP="$(sudo /usr/bin/mktemp /tmp/vibewake.XXXXXX)"

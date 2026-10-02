@@ -20,7 +20,7 @@ When the last agent finishes with the lid closed, VibeWake puts the Mac to sleep
 The script does the following:
 
 1. Builds `~/Applications/VibeWake.app`.
-2. Adds `/etc/sudoers.d/vibewake`, which lets your user run **only** `pmset -a disablesleep 0|1` without a password. This asks for your password once. It is the only way to stop lid-close sleep.
+2. Adds `/etc/sudoers.d/vibewake`, which lets your user run **only** `pmset -a disablesleep 0|1` and `pmset schedule wake|cancel wake <date>` without a password. This asks for your password once. `disablesleep` is the only way to stop lid-close sleep; the scheduled wakes let the [phone app](#phone-app) reach a sleeping Mac.
 3. Merges hooks into `~/.claude/settings.json` and backs up the original to `settings.json.vibewake-backup`. It also adds a short block, between `<!-- vibewake:start -->` and `<!-- vibewake:end -->`, to `~/.claude/CLAUDE.md` (see [How prompts are delivered](#how-prompts-are-delivered)).
 4. Installs the pi extension to `~/.pi/agent/extensions/vibewake/`.
 5. Adds a LaunchAgent that starts VibeWake at login and restarts it if it crashes.
@@ -93,6 +93,32 @@ Claude Code (v2.1.224 or later) gives each session an inbox socket for [cross-se
 - If you set `crossSessionInbound` to `refuse` or `hold`, the autopilot can't deliver.
 - Chats started before you install the updated hooks can't receive prompts until they fire a hook again. Sending any prompt is enough.
 - pi chats are listed but can't receive prompts.
+
+## Phone app
+
+An Android app can watch and drive VibeWake on all your Macs: see each chat's state and last reply, edit queues, send prompts, start new chats, and get a notification when a chat finishes, hits a usage limit or waits for you. Macs and the phone talk through a small relay server you host ([server/](server/README.md)); neither needs to be reachable from the internet.
+
+```
+Android app ──WSS──► relay (server/) ◄──WSS── VibeWake on each Mac
+     ▲                  │
+     └── UnifiedPush ◄─ ntfy
+```
+
+1. Run the relay and ntfy on your server: see [server/README.md](server/README.md).
+2. On the Mac: **Show Agents… → Phone app**, enter the relay URL and its setup code, then **Connect** (or run `VibeWake remote setup <url> <setup-code>`).
+3. Build and install the app ([android/README.md](android/README.md)), then **Pair Phone…** on the Mac and scan the code.
+
+What the phone can do on the Mac:
+
+- **Queue and send prompts** to existing chats, just like the Agents window.
+- **Start a new chat** in a project folder the Mac already works in. If someone is at the Mac (screen unlocked, lid open), it opens a new editor tab as a queued "new chat" does. Otherwise it runs headless with `claude -p` in that folder (permission mode from `headlessPermissionMode`, default `acceptEdits`), and later prompts continue it with `--resume`. Set `remoteNewChats` to `headless` or `editor` to always use one.
+- **Wake a sleeping Mac.** A sleeping Mac can't be reached, so before sleeping VibeWake schedules a wake (`pmset schedule wake`) every `wakeIntervalMinutes` (default 15, `0` = never; skipped on battery below 20%). On waking it connects, picks up what the phone sent meanwhile, and goes back to sleep if there is nothing to do. The phone shows when the next check-in is.
+
+**Allow remote control** (Phone app bar) turns all of this off: the phone can then only watch. Run `VibeWake remote status` to see the setup, `VibeWake remote off` to disconnect.
+
+New settings in `settings.json`: `remoteControl`, `wakeIntervalMinutes`, `remoteNewChats` (`auto` | `headless` | `editor`), `headlessPermissionMode`, `claudePath` (default: `claude` on your login shell's PATH, else the binary inside the VS Code / Cursor extension), and `remoteProjects` (extra folders the phone may start chats in, besides those of recent chats).
+
+What goes through the relay: chat titles, folders, states, queued prompts and replies (the first 8 KB, the rest on request). Inbox sockets and tokens never leave the Mac. Machine and phone tokens are stored hashed on the relay; the Mac's token is in `~/.vibewake/state/remote.json` (mode 0600).
 
 ## Logs
 

@@ -87,6 +87,9 @@ enum SessionInbox {
         var ai: String?
         /// When the last event so far is the user interrupting (Esc): its time, else nil.
         var interruptedAt: Double?
+        /// The assistant's latest text block since the last human prompt, and when it was written.
+        var reply: String?
+        var replyAt: Double?
     }
 
     private static var scans: [String: Scan] = [:]
@@ -96,6 +99,12 @@ enum SessionInbox {
     static func title(transcript path: String?) -> String? {
         guard let path, let s = scan(path) else { return nil }
         return s.custom ?? s.ai
+    }
+
+    /// Claude's last text message in the transcript (its final answer once a turn ends).
+    static func lastReply(transcript path: String?) -> (text: String, at: Double)? {
+        guard let path, let s = scan(path), let text = s.reply else { return nil }
+        return (text, s.replyAt ?? 0)
     }
 
     /// True when the transcript's last event is the user interrupting (Esc) a turn that started
@@ -134,6 +143,10 @@ enum SessionInbox {
     private static let customKey = Data("\"custom-title\"".utf8), aiKey = Data("\"ai-title\"".utf8)
     private static let interruptKey = Data("\"text\":\"[Request interrupted by user".utf8)
     private static let assistantKey = Data("\"type\":\"assistant\"".utf8)
+    private static let userKey = Data("\"type\":\"user\"".utf8)
+    private static let textBlockKey = Data("\"type\":\"text\"".utf8)
+    /// Replies longer than this are cut (the phone shows replies, not whole documents).
+    static let maxReply = 64 * 1024
 
     private static let iso: ISO8601DateFormatter = {
         let f = ISO8601DateFormatter()
@@ -147,10 +160,31 @@ enum SessionInbox {
         return (iso.date(from: ts) ?? ISO8601DateFormatter().date(from: ts))?.timeIntervalSince1970
     }
 
+    /// The joined text blocks of a user/assistant line (a plain string content counts as one block).
+    private static func blockText(_ line: Data.SubSequence, role: String) -> String? {
+        guard let obj = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any],
+              obj["type"] as? String == role, obj["isMeta"] as? Bool != true,
+              let message = obj["message"] as? [String: Any] else { return nil }
+        if let text = message["content"] as? String { return text }
+        guard let blocks = message["content"] as? [[String: Any]] else { return nil }
+        let texts = blocks.compactMap { $0["type"] as? String == "text" ? $0["text"] as? String : nil }
+        return texts.isEmpty ? nil : texts.joined(separator: "\n\n")
+    }
+
     private static func consume(_ data: Data, into s: inout Scan) {
         for line in data.split(separator: 0x0A) {
-            if line.range(of: assistantKey) != nil { s.interruptedAt = nil }
+            if line.range(of: assistantKey) != nil {
+                s.interruptedAt = nil
+                if line.range(of: textBlockKey) != nil, let text = blockText(line, role: "assistant") {
+                    s.reply = text.count > maxReply ? String(text.prefix(maxReply)) : text
+                    s.replyAt = timestamp(of: line)
+                }
+            }
             else if line.range(of: interruptKey) != nil { s.interruptedAt = timestamp(of: line) ?? Date().timeIntervalSince1970 }
+            else if line.range(of: userKey) != nil, let text = blockText(line, role: "user"), !text.isEmpty {
+                // A new human prompt (tool results have no top-level text): the previous reply is answered.
+                s.reply = nil; s.replyAt = nil
+            }
             guard line.range(of: customKey) != nil || line.range(of: aiKey) != nil,
                   let obj = (try? JSONSerialization.jsonObject(with: Data(line))) as? [String: Any] else { continue }
             if obj["type"] as? String == "custom-title", let t = (obj["customTitle"] ?? obj["title"]) as? String { s.custom = t }

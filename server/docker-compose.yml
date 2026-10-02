@@ -1,0 +1,31 @@
+# VibeWake relay + ntfy (push notifications for the Android app).
+# Put both behind your HTTPS reverse proxy, e.g. relay.example.com → relay:8080, ntfy.example.com → ntfy:80.
+services:
+  relay:
+    build: .
+    restart: unless-stopped
+    environment:
+      SETUP_CODE: ${SETUP_CODE:?set SETUP_CODE in .env}
+    volumes:
+      - relay-data:/data
+    ports:
+      - "127.0.0.1:8080:8080"
+
+  ntfy:
+    image: binwiederhier/ntfy
+    command: serve
+    restart: unless-stopped
+    environment:
+      NTFY_BASE_URL: ${NTFY_BASE_URL:?set NTFY_BASE_URL in .env, e.g. https://ntfy.example.com}
+      NTFY_CACHE_FILE: /var/cache/ntfy/cache.db
+      NTFY_BEHIND_PROXY: "true"
+      # UnifiedPush topics are random ("up" + 12 chars), so open access is the usual setup.
+      # To lock the server down, see server/README.md ("Locking down ntfy").
+    volumes:
+      - ntfy-cache:/var/cache/ntfy
+    ports:
+      - "127.0.0.1:8081:80"
+
+volumes:
+  relay-data:
+  ntfy-cache:

@@ -160,7 +160,8 @@ enum Installer {
     // MARK: sudoers (lid-closed support)
 
     static var sudoersRule: String {
-        "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1\n"
+        "\(NSUserName()) ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1, "
+            + "/usr/bin/pmset schedule wake *, /usr/bin/pmset schedule cancel wake *\n"
     }
 
     /// Installs /etc/sudoers.d/vibewake via an admin password prompt.
