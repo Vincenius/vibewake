@@ -11,7 +11,7 @@ services:
     volumes:
       - relay-data:/data
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:3030:8080"
 
   ntfy:
     image: binwiederhier/ntfy
@@ -26,7 +26,7 @@ services:
     volumes:
       - ntfy-cache:/var/cache/ntfy
     ports:
-      - "127.0.0.1:8081:80"
+      - "127.0.0.1:3031:80"
 
 volumes:
   relay-data:

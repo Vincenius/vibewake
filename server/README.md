@@ -15,14 +15,14 @@ ENV
 docker compose up -d --build
 ```
 
-This starts the relay on `127.0.0.1:8080` and ntfy on `127.0.0.1:8081`. Put both behind your HTTPS reverse proxy. With Caddy:
+This starts the relay on `127.0.0.1:3030` and ntfy on `127.0.0.1:3031`. Put both behind your HTTPS reverse proxy. With Caddy:
 
 ```
 relay.example.com {
-    reverse_proxy 127.0.0.1:8080
+    reverse_proxy 127.0.0.1:3030
 }
 ntfy.example.com {
-    reverse_proxy 127.0.0.1:8081
+    reverse_proxy 127.0.0.1:3031
 }
 ```
 
