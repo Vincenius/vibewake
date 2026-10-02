@@ -30,7 +30,22 @@ docker run --rm --platform linux/amd64 -v "$PWD":/project -w /project \
   ghcr.io/cirruslabs/android-sdk:36 ./gradlew assembleDebug
 ```
 
-The `release` build type is signed with the debug key, so that you can sideload it straight away. To sign it with your own key, add a `signingConfigs` block in `app/build.gradle.kts`.
+### Release build
+
+Create a release key once, and keep it (and its passwords) safe: updates to an installed app must be signed with the same key.
+
+```bash
+keytool -genkeypair -v -keystore vibewake-release.jks -alias vibewake -keyalg RSA -keysize 4096 -validity 10000
+cat > keystore.properties <<'EOF'
+storeFile=vibewake-release.jks
+storePassword=<store password>
+keyAlias=vibewake
+keyPassword=<key password>
+EOF
+./gradlew assembleRelease   # → app/build/outputs/apk/release/app-release.apk
+```
+
+`keystore.properties` and `*.jks` are in `.gitignore`. Without `keystore.properties` the release build is signed with the debug key, so that you can sideload it straight away.
 
 ## Set up
 
