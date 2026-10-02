@@ -28,6 +28,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -55,6 +56,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.vibewake.app.data.Connection
 import com.vibewake.app.data.QueueItem
 import com.vibewake.app.data.Relay
 import com.vibewake.app.data.RelayState
@@ -77,9 +79,9 @@ fun SessionScreen(
     val busy = state.commands.values.any { it.open && it.machineId == machineId && it.sessionId == sessionId }
     var editing by remember { mutableStateOf<QueueItem?>(null) }
 
-    fun send(type: String, vararg fields: Pair<String, Any?>) {
-        relay.send(machineId, relay.command(type, "sessionId" to sessionId, *fields))
-    }
+    /** Returns whether the command went out (false: offline, keep what the user typed). */
+    fun send(type: String, vararg fields: Pair<String, Any?>): Boolean =
+        relay.send(machineId, relay.command(type, "sessionId" to sessionId, *fields)) != null
 
     Scaffold(
         topBar = {
@@ -93,10 +95,25 @@ fun SessionScreen(
         Column(Modifier.fillMaxSize().padding(pad).imePadding()) {
             if (busy) LinearProgressIndicator(Modifier.fillMaxWidth()) // waiting for the Mac to confirm
             if (s == null) {
-                Text(
-                    if (machine?.online == false) "The Mac is not connected." else "This chat is closed.",
-                    Modifier.padding(16.dp),
-                )
+                // Before the first machine list (or snapshot) arrives, the chat isn't known either way.
+                val loading = !state.machinesLoaded || (machine != null && machine.snapshot == null && machine.online)
+                val connecting = state.connection == Connection.Connecting || state.connection == Connection.Online
+                if (loading && connecting) {
+                    Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(Modifier.width(12.dp))
+                        Text("Connecting…")
+                    }
+                } else {
+                    Text(
+                        when {
+                            !state.machinesLoaded -> "Not connected to the relay."
+                            machine?.online == false -> "The Mac is not connected."
+                            else -> "This chat is closed."
+                        },
+                        Modifier.padding(16.dp),
+                    )
+                }
                 return@Column
             }
             Column(
@@ -110,7 +127,9 @@ fun SessionScreen(
                     if (s.blocked != null) AssistChip({ send("resumeQueue") }, { Text("Resume autopilot") })
                 }
 
-                ReplyCard(s, state.fullReplies[sessionId]) { send("fetchReply") }
+                // A full reply fetched earlier only counts while it's still the latest one.
+                val full = state.fullReplies[sessionId]?.takeIf { it.at == s.reply?.at }?.text
+                ReplyCard(s, full) { send("fetchReply") }
 
                 Text("Queue", style = MaterialTheme.typography.titleMedium)
                 if (s.queue.isEmpty()) {
@@ -139,8 +158,7 @@ fun SessionScreen(
 
     editing?.let { item ->
         EditDialog(item, onDismiss = { editing = null }) { text, mode ->
-            send("queueEdit", "itemId" to item.id, "text" to text, "mode" to mode)
-            editing = null
+            if (send("queueEdit", "itemId" to item.id, "text" to text, "mode" to mode)) editing = null
         }
     }
 }
@@ -221,7 +239,7 @@ private fun ModePicker(mode: String, onChange: (String) -> Unit, modifier: Modif
 }
 
 @Composable
-private fun Composer(s: Session, onSend: (text: String, mode: String, now: Boolean) -> Unit) {
+private fun Composer(s: Session, onSend: (text: String, mode: String, now: Boolean) -> Boolean) {
     var text by remember(s.id) { mutableStateOf("") }
     var mode by remember(s.id) { mutableStateOf("sameChat") }
     Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -229,10 +247,10 @@ private fun Composer(s: Session, onSend: (text: String, mode: String, now: Boole
         ModePicker(mode, { mode = it }, Modifier.fillMaxWidth())
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.End)) {
             OutlinedButton(
-                { onSend(text.trim(), mode, true); text = "" },
+                { if (onSend(text.trim(), mode, true)) text = "" },
                 enabled = text.isNotBlank() && mode == "sameChat" && (s.canReceive || s.headless),
             ) { Text("Send now") }
-            Button({ onSend(text.trim(), mode, false); text = "" }, enabled = text.isNotBlank()) { Text("Queue") }
+            Button({ if (onSend(text.trim(), mode, false)) text = "" }, enabled = text.isNotBlank()) { Text("Queue") }
         }
     }
 }

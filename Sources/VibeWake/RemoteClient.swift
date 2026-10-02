@@ -108,6 +108,8 @@ final class RemoteClient: NSObject, ObservableObject, URLSessionWebSocketDelegat
     var onSynced: (() -> Void)?
 
     @Published private(set) var config: RemoteConfig?
+    /// The relay rejected our token: don't reconnect (or wake up to) until remote access is set up again.
+    private(set) var rejected = false
     private var session: URLSession!
     private var task: URLSessionWebSocketTask?
     private var backoff: Double = 1
@@ -135,13 +137,14 @@ final class RemoteClient: NSObject, ObservableObject, URLSessionWebSocketDelegat
         let c = RemoteConfig.load()
         guard c != config else { return }
         config = c
+        rejected = false
         disconnect()
         if c != nil { connect() } else { status = .off }
     }
 
     /// Reconnect right away (after waking up), instead of waiting out the backoff.
     func reconnectNow() {
-        guard config != nil else { return }
+        guard config != nil, !rejected else { return }
         backoff = 1
         disconnect()
         connect()
@@ -206,6 +209,7 @@ final class RemoteClient: NSObject, ObservableObject, URLSessionWebSocketDelegat
         if closeCode.rawValue == 4001 {
             // The relay doesn't know this token (Mac removed there): stop retrying.
             Log.write("remote", "Server rejected this Mac's token — set up remote access again")
+            rejected = true
             disconnect()
             status = .failed("token rejected — set up again")
             return

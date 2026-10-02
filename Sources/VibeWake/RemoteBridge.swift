@@ -97,11 +97,16 @@ final class RemoteBridge {
             let project = (chat.cwd as NSString).lastPathComponent
             let title = SessionInbox.title(transcript: chat.transcript) ?? "\(project) · \(chat.session.prefix(8))"
             let running = headless.isRunning(chat.session)
+            let next: String?
+            if running { next = nil }
+            else if let at = headless.continueAt(chat) {
+                next = settings.autoContinue ? "“\(settings.continuePrompt)” at \(Autopilot.clock(at))" : "usage limit (auto-continue off)"
+            } else { next = PromptQueue.load(chat.key).isEmpty ? nil : "runs queued prompt" }
             sessions.append(RemoteSnapshot.Session(
                 id: chat.key, agent: "claude", session: chat.session, project: project, cwd: chat.cwd, title: title,
-                state: running ? "working" : chat.failed == nil ? "finished" : "failed",
-                stateSince: running ? chat.startedAt : chat.endedAt, limitedUntil: nil, subagents: 0,
-                canReceive: !running, headless: true, blocked: chat.failed, next: running ? nil : PromptQueue.load(chat.key).isEmpty ? nil : "runs queued prompt",
+                state: running ? "working" : chat.limitResetAt != nil ? "limited" : chat.failed == nil ? "finished" : "failed",
+                stateSince: running ? chat.startedAt : chat.endedAt, limitedUntil: running ? nil : chat.limitResetAt, subagents: 0,
+                canReceive: !running, headless: true, blocked: chat.failed, next: next,
                 queue: Self.items(PromptQueue.load(chat.key)),
                 reply: Self.reply(transcript: chat.transcript, fallback: chat.lastResult)))
         }
@@ -192,7 +197,7 @@ final class RemoteBridge {
         let sid = cmd["sessionId"] as? String ?? ""
         let snap = snapshot()
         let session = snap.sessions.first { $0.id == sid }
-        let readOnly: Set<String> = ["fetchReply", "setPaused"]
+        let readOnly: Set<String> = ["fetchReply"]
         if !settings.remoteControl && !readOnly.contains(type) { return (false, "remote control is turned off on this Mac", nil) }
 
         func itemId() -> UUID? { (cmd["itemId"] as? String).flatMap(UUID.init(uuidString:)) }

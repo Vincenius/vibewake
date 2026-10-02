@@ -7,7 +7,7 @@ import kotlinx.serialization.json.JsonObject
 
 /** Mirrors protocol/PROTOCOL.md. Times are epoch seconds. */
 
-val json = Json { ignoreUnknownKeys = true; explicitNulls = false; encodeDefaults = true }
+val json = Json { ignoreUnknownKeys = true; coerceInputValues = true; explicitNulls = false; encodeDefaults = true }
 
 @Serializable
 data class Machine(

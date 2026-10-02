@@ -140,6 +140,7 @@ Choose **Show Logs…** in the menu (⌘L while the menu is open), or run `VibeW
 | `[state]` | Switches between ACTIVE, IDLE and PAUSED |
 | `[sleep]` | Power assertion on/off, `disablesleep` on/off (or a failure), forced sleep after work ends with the lid closed, low-battery override |
 | `[system]` | Mac going to sleep or waking up, display sleep or wake, lid closed or opened |
+| `[remote]` | Phone app: relay connection, commands from the phone, check-in wakes, headless chats (started, finished, usage limit) |
 | `[app]` | Start, quit, pause, and installs |
 
 ## Safety

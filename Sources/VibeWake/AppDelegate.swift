@@ -34,6 +34,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var pendingWakeAt: Double?
     /// On battery below this, don't wake up just to check in.
     static let checkInMinBattery = 20
+    /// Check-ins in a row that timed out: the wake interval doubles with each (relay unreachable).
+    private var failedCheckIns = 0
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Paths.ensure()
@@ -65,7 +67,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.togglePause()
         }
         remote.client.onSynced = { [weak self] in
-            guard let self, self.checkIn != nil else { return }
+            guard let self else { return }
+            self.failedCheckIns = 0
+            guard self.checkIn != nil else { return }
             self.checkIn?.syncedAt = Date().timeIntervalSince1970
         }
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.tick() }
@@ -133,6 +137,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard synced || now > c.deadline else { return false }
         checkIn = nil
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
+        failedCheckIns = synced ? 0 : failedCheckIns + 1
         Log.write("remote", synced ? "Check-in done" : "Check-in timed out (server unreachable?)")
         // Woke only to check in, nothing came up, and nobody is using the Mac: sleep right away.
         guard c.scheduled, items.isEmpty, autopilot.keepAwakeReasons.isEmpty, idle > 120 else { return false }
@@ -145,9 +150,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Before sleeping: wake up again in a while to pick up prompts sent from the phone.
     private func scheduleCheckInWake() {
         guard remote.client.config != nil else { return }
-        let minutes = autopilot.settings.wakeIntervalMinutes
+        // Back off while the relay is unreachable: 2×, 4×, 8×… the interval, at most 4 hours (or the interval itself).
+        let base = autopilot.settings.wakeIntervalMinutes
+        let minutes = min(base * pow(2, Double(min(failedCheckIns, 6))), max(base, 240))
         var next: Double?
-        if minutes > 0, !(SleepController.battery.map { $0.onBattery && $0.percent < Self.checkInMinBattery } ?? false) {
+        if base > 0, !remote.client.rejected,
+           !(SleepController.battery.map { $0.onBattery && $0.percent < Self.checkInMinBattery } ?? false) {
             let at = Date().addingTimeInterval(minutes * 60)
             if sleep.scheduleWake(at: at) { next = at.timeIntervalSince1970 }
         }
@@ -160,7 +168,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let scheduled = pendingWakeAt.map { abs(now - $0) < 120 } ?? false
         pendingWakeAt = nil
         sleep.cancelWake() // woke early (or on time): don't wake again for that one
-        guard remote.client.config != nil else { return }
+        guard remote.client.config != nil, !remote.client.rejected else { return }
         if scheduled { Log.write("remote", "Woke up to check in with the phone app") }
         checkIn = (deadline: now + 60, syncedAt: nil, scheduled: scheduled)
         remote.client.reconnectNow()
@@ -354,13 +362,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func installSudoers() {
-        do {
-            try Installer.installSudoersInteractively()
-            Log.write("app", "Lid-closed support enabled (sudoers rule installed)")
-            lidSupport = sleep.lidSupportAvailable
-            if sleep.isHolding { sleep.hold(reason: "AI agent working") } // apply disablesleep now
-        } catch {
-            alert("Could not enable lid-closed support", error.localizedDescription)
+        // The password prompt can stay up for a while: don't stop the timers (and sleep control) meanwhile.
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try Installer.installSudoersInteractively() }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success:
+                    Log.write("app", "Lid-closed support enabled (sudoers rule installed)")
+                    self.lidSupport = self.sleep.lidSupportAvailable
+                    if self.sleep.isHolding { self.sleep.hold(reason: "AI agent working") } // apply disablesleep now
+                case .failure(let error):
+                    self.alert("Could not enable lid-closed support", error.localizedDescription)
+                }
+            }
         }
     }
 

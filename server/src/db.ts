@@ -115,6 +115,10 @@ export class Store {
     this.db.query("UPDATE devices SET push_endpoint = ? WHERE id = ?").run(endpoint, id);
   }
 
+  deleteDevice(id: string) {
+    this.db.query("DELETE FROM devices WHERE id = ?").run(id);
+  }
+
   // Pairing codes
 
   addPairing(code: string, machineId: string, expiresAt: number) {

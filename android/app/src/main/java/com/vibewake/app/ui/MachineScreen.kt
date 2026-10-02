@@ -132,8 +132,8 @@ fun MachineScreen(
             },
             onDismiss = { newPrompt = false },
             onSend = { cwd, prompt ->
-                relay.send(machineId, relay.command("newSession", "cwd" to cwd, "prompt" to prompt))
-                newPrompt = false
+                // Keep the dialog (and the prompt) open when it couldn't be sent.
+                if (relay.send(machineId, relay.command("newSession", "cwd" to cwd, "prompt" to prompt)) != null) newPrompt = false
             },
         )
     }

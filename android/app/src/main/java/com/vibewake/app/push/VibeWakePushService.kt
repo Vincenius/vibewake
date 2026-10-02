@@ -13,6 +13,7 @@ import com.vibewake.app.data.json
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import org.unifiedpush.android.connector.FailedReason
 import org.unifiedpush.android.connector.PushService
@@ -24,12 +25,19 @@ class VibeWakePushService : PushService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val app get() = application as VibeWakeApp
 
+    // If posting fails, Relay keeps the endpoint and retries when it next connects.
     override fun onNewEndpoint(endpoint: PushEndpoint, instance: String) {
         scope.launch { runCatching { app.relay.setPushEndpoint(endpoint.url) } }
     }
 
+    // After unpairing this is a no-op: the relay deleted the device and its endpoint.
     override fun onUnregistered(instance: String) {
         scope.launch { runCatching { app.relay.setPushEndpoint(null) } }
+    }
+
+    override fun onDestroy() {
+        scope.cancel()
+        super.onDestroy()
     }
 
     override fun onRegistrationFailed(reason: FailedReason, instance: String) {}

@@ -6,6 +6,8 @@ services:
     restart: unless-stopped
     environment:
       SETUP_CODE: ${SETUP_CODE:?set SETUP_CODE in .env}
+      # Rate limits use the client IP from X-Forwarded-For (only reachable through the proxy, see ports).
+      TRUST_PROXY: "1"
     volumes:
       - relay-data:/data
     ports:

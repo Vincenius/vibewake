@@ -26,7 +26,7 @@ enum Installer {
     static func installClaudeHooks() throws -> Bool {
         var settings = try loadJSON(claudeSettingsURL)
         var hooks = settings["hooks"] as? [String: Any] ?? [:]
-        let command = "'\(executablePath)' hook claude"
+        let command = "\(shellQuoted(executablePath)) hook claude"
         var changed = false
 
         for (event, matcher) in claudeEvents {
@@ -84,7 +84,7 @@ enum Installer {
         let new = rest + claudeInstructions + "\n"
         guard new != old else { return false }
         try FileManager.default.createDirectory(at: claudeMemoryURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try new.write(to: claudeMemoryURL, atomically: true, encoding: .utf8)
+        try new.write(to: claudeMemoryURL.resolvingSymlinksInPath(), atomically: true, encoding: .utf8)
         return true
     }
 
@@ -92,7 +92,7 @@ enum Installer {
         guard let old = try? String(contentsOf: claudeMemoryURL, encoding: .utf8) else { return }
         let rest = removingBlock(from: old).trimmingCharacters(in: .whitespacesAndNewlines)
         if rest.isEmpty { try FileManager.default.removeItem(at: claudeMemoryURL) }
-        else if rest + "\n" != old { try (rest + "\n").write(to: claudeMemoryURL, atomically: true, encoding: .utf8) }
+        else if rest + "\n" != old { try (rest + "\n").write(to: claudeMemoryURL.resolvingSymlinksInPath(), atomically: true, encoding: .utf8) }
     }
 
     private static func removingBlock(from text: String) -> String {
@@ -103,7 +103,8 @@ enum Installer {
         return String(text[..<start.lowerBound]) + after
     }
 
-    /// Our command is `'<path>/VibeWake' hook <agent>` (older installs may lack the quotes).
+    /// Our command is `'<path>/VibeWake' hook <agent>` (older installs may lack the quotes;
+    /// a `'` in the path is escaped as `'\''`, which leaves the end of the command as is).
     private static func isOurs(_ group: [String: Any]) -> Bool {
         (group["hooks"] as? [[String: Any]] ?? []).contains {
             guard let cmd = $0["command"] as? String else { return false }
@@ -196,10 +197,17 @@ enum Installer {
     private static func writeJSON(_ obj: [String: Any], to url: URL) throws {
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let data = try JSONSerialization.data(withJSONObject: obj, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        try data.write(to: url, options: .atomic)
+        // An atomic write replaces a symlink (dotfiles repos) with a file: write to its target instead.
+        try data.write(to: url.resolvingSymlinksInPath(), options: .atomic)
+    }
+
+    /// `path` in single quotes for the shell, with `'` written as `'\''`.
+    static func shellQuoted(_ path: String) -> String {
+        "'" + path.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 
     private static func backupOnce(_ url: URL) throws {
+        let url = url.resolvingSymlinksInPath()
         let backup = url.appendingPathExtension("vibewake-backup")
         if FileManager.default.fileExists(atPath: url.path), !FileManager.default.fileExists(atPath: backup.path) {
             try FileManager.default.copyItem(at: url, to: backup)

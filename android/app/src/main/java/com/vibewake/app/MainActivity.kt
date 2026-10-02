@@ -43,7 +43,8 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        takePairLink(intent)
+        // Only a fresh launch: after rotation or from recents, the link's code has already been used.
+        if (savedInstanceState == null && (intent.flags and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) == 0) takePairLink(intent)
         setContent {
             VibeWakeTheme {
                 val state by app.relay.state.collectAsStateWithLifecycle()
@@ -54,11 +55,17 @@ class MainActivity : ComponentActivity() {
 
                 NavHost(navController, startDestination = start) {
                     composable("pair") {
-                        PairScreen(app.relay, pairLink) {
-                            pairLink = null
-                            navController.navigate("machines") { popUpTo("pair") { inclusive = true } }
-                            askForNotifications()
+                        val onPaired = {
+                            if (navController.currentDestination?.route == "pair") {
+                                pairLink = null
+                                navController.navigate("machines") { popUpTo("pair") { inclusive = true } }
+                                askForNotifications()
+                            }
                         }
+                        // Pairing may finish after a configuration change cancelled the screen that started it.
+                        val paired by app.relay.paired.collectAsStateWithLifecycle()
+                        LaunchedEffect(paired) { if (paired && pairLink == null) onPaired() }
+                        PairScreen(app.relay, pairLink, onPaired)
                     }
                     composable("machines") {
                         MachinesScreen(
@@ -113,6 +120,8 @@ class MainActivity : ComponentActivity() {
         val data = intent?.dataString ?: return false
         if (parsePairLink(data) == null) return false
         pairLink = data
+        // Don't pair again with this (now used) code when the activity is recreated.
+        setIntent(Intent(intent).setData(null))
         return true
     }
 

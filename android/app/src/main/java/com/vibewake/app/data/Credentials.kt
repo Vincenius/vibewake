@@ -4,7 +4,7 @@ import android.content.Context
 
 /**
  * The relay URL and this phone's device token. Kept in app-private storage
- * (not backed up: allowBackup is off), so only this app can read it.
+ * (excluded from backups and device transfers), so only this app can read it.
  */
 class Credentials(context: Context) {
     private val prefs = context.getSharedPreferences("relay", Context.MODE_PRIVATE)
@@ -17,6 +17,11 @@ class Credentials(context: Context) {
     var pushEndpoint: String?
         get() = prefs.getString("pushEndpoint", null)
         set(v) = prefs.edit().putString("pushEndpoint", v).apply()
+
+    /** Endpoint still to be sent to the relay ("": stop pushing), retried when the relay connects. */
+    var pendingPushEndpoint: String?
+        get() = prefs.getString("pushPending", null)
+        set(v) = prefs.edit().putString("pushPending", v).apply()
 
     fun save(server: String, token: String) {
         prefs.edit().putString("server", server).putString("token", token).remove("pushEndpoint").apply()

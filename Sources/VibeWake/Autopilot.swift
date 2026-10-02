@@ -115,6 +115,8 @@ final class Autopilot: ObservableObject {
         /// The queue item this was, put back in front of the queue if no turn starts.
         var item: QueuedPrompt? }
     private var deliveries: [String: Delivery] = [:]
+    /// When we last sent the continue prompt after a usage limit, per session (retries are spaced out).
+    private var lastContinue: [String: Double] = [:]
     /// Stall nudges per session: the heartbeat they were sent at and how many in a row.
     private var nudges: [String: (heartbeat: Double, at: Double, count: Int)] = [:]
     /// Chats we stopped acting on after a failed delivery: until the user resumes, or 10 minutes pass.
@@ -205,6 +207,7 @@ final class Autopilot: ObservableObject {
         // Forget state of closed sessions.
         deliveries = deliveries.filter { byId[$0.key] != nil }
         nudges = nudges.filter { byId[$0.key] != nil }
+        lastContinue = lastContinue.filter { byId[$0.key] != nil }
         blocked = blocked.filter { byId[$0.key] != nil && now - $0.value.at < Self.blockedRetry }
 
         for i in list.indices {
@@ -281,11 +284,12 @@ final class Autopilot: ObservableObject {
         switch s.state {
         case .limited(let until):
             guard settings.autoContinue else { return "usage limit (auto-continue off)" }
-            let at = until + 60
+            // Not sooner than minContinueInterval after the last try: a reset time in the past would retry every tick.
+            let at = max(until + 60, (lastContinue[s.id] ?? 0) + HeadlessRunner.minContinueInterval)
             if now >= at {
-                if deliver(settings.continuePrompt, to: s, now: now) {
-                    MarkerStore.modify(presenceURL(s)) { $0.limitResetAt = nil }
-                }
+                // limitResetAt stays until the turn starts (the UserPromptSubmit hook clears it): if none does,
+                // the delivery times out, the chat is paused for a while, and the next try comes after that.
+                if deliver(settings.continuePrompt, to: s, now: now) { lastContinue[s.id] = now }
                 return nil
             }
             return "“\(settings.continuePrompt)” at \(Self.clock(at))"
@@ -413,6 +417,8 @@ final class Autopilot: ObservableObject {
         c.host = "anthropic.claude-code"
         c.path = "/open"
         c.queryItems = [URLQueryItem(name: "cwd", value: cwd)] + (prefill.map { [URLQueryItem(name: "q", value: String($0.prefix(5000)))] } ?? [])
+        // URLComponents leaves "+" alone, but the receiving end decodes it as a space.
+        c.percentEncodedQuery = c.percentEncodedQuery?.replacingOccurrences(of: "+", with: "%2B")
         guard let url = c.url else { return false }
         return NSWorkspace.shared.open(url)
     }

@@ -11,7 +11,8 @@ Every WebSocket message is one JSON object with a `type`.
 | `POST /api/mac/register` | none | `{setupCode, machineId, name}` → `{token}` — `setupCode` is the relay's `SETUP_CODE` |
 | `POST /api/mac/pair` | Bearer mac token | → `{code, expiresAt}` — one-time phone pairing code, valid 5 min |
 | `POST /api/device/register` | none | `{code, name}` → `{token, deviceId}` |
-| `POST /api/device/push` | Bearer device token | `{endpoint: string \| null}` — UnifiedPush endpoint |
+| `POST /api/device/push` | Bearer device token | `{endpoint: string \| null}` → `{ok: true}` — UnifiedPush endpoint; `null` removes it. `400 {error}` unless `https` and not a loopback/private/link-local IP (http only with the relay's `ALLOW_HTTP_PUSH=1`) |
+| `DELETE /api/device` | Bearer device token | → `204` — unpair: deletes this device (token and push endpoint) and closes its `/ws/app` connections with code 4001. The token then gets `401` |
 | `GET /api/machines` | Bearer device token | → `{machines: Machine[]}` |
 | `GET /healthz` | none | → `ok` |
 
@@ -22,7 +23,7 @@ Tokens are 32 random bytes (base64url). The relay stores only their SHA-256.
 
 Mac → relay:
 - `{type:"hello", machineId, name, model, appVersion}` — first message after connecting.
-- `{type:"snapshot", snapshot: Snapshot}` — whenever it changes.
+- `{type:"snapshot", snapshot: Snapshot}` — whenever it changes. The relay drops (and logs) a snapshot that doesn't match `Snapshot` below: a session needs `id`, a queue item `id` and `text`, a reply `text`, a battery both fields. Other fields may be left out (nullable ones may be `null`) but must have the documented type; unknown fields are passed through.
 - `{type:"ping"}` — every 25 s, keeps `lastSeen` fresh.
 - `{type:"event", event: {kind, sessionId, title, text}}`. `kind` is one of `finished | failed | limited | waiting`.
 - `{type:"ack", id, ok, error?, result?}` — the outcome of one command.

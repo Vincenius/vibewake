@@ -1,7 +1,7 @@
 import type { Server, ServerWebSocket } from "bun";
 import { z } from "zod";
 import { Store, now, type CommandRow, type MachineRow } from "./db";
-import { sendPush, type PushPayload } from "./push";
+import { pushEndpointError, sendPush, type PushPayload } from "./push";
 
 /** See protocol/PROTOCOL.md for every message. */
 
@@ -24,9 +24,45 @@ export const Command = z.discriminatedUnion("type", [
   z.object({ type: z.literal("setPaused"), paused: z.boolean() }),
 ]);
 
+// Snapshot shape (loosely: optional fields may be missing, unknown ones pass through), so the
+// relay never stores or forwards something the app can't decode. Swift omits nil optionals.
+const QueueItem = z.object({ id: z.string(), text: z.string(), mode: z.string().optional(), createdAt: z.number().optional() }).passthrough();
+const Session = z
+  .object({
+    id: z.string().min(1),
+    agent: z.string().optional(),
+    session: z.string().optional(),
+    project: z.string().nullish(),
+    cwd: z.string().nullish(),
+    title: z.string().optional(),
+    state: z.string().optional(),
+    stateSince: z.number().nullish(),
+    limitedUntil: z.number().nullish(),
+    subagents: z.number().int().optional(),
+    canReceive: z.boolean().optional(),
+    headless: z.boolean().optional(),
+    blocked: z.string().nullish(),
+    next: z.string().nullish(),
+    queue: z.array(QueueItem).optional(),
+    reply: z.object({ text: z.string(), at: z.number().optional(), truncated: z.boolean().optional() }).passthrough().nullish(),
+  })
+  .passthrough();
+export const Snapshot = z
+  .object({
+    paused: z.boolean().optional(),
+    remoteControl: z.boolean().optional(),
+    lidClosed: z.boolean().optional(),
+    battery: z.object({ onBattery: z.boolean(), percent: z.number().int() }).passthrough().nullish(),
+    nobodyAtScreen: z.boolean().optional(),
+    wakeIntervalMinutes: z.number().optional(),
+    projects: z.array(z.string()).optional(),
+    sessions: z.array(Session).optional(),
+  })
+  .passthrough();
+
 const MacMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("hello"), machineId: z.string(), name: z.string().max(200), model: z.string().max(100).default(""), appVersion: z.string().optional() }),
-  z.object({ type: z.literal("snapshot"), snapshot: z.record(z.unknown()) }),
+  z.object({ type: z.literal("snapshot"), snapshot: Snapshot }),
   z.object({ type: z.literal("ping") }),
   z.object({
     type: z.literal("event"),
@@ -51,6 +87,10 @@ export interface RelayOptions {
   commandMaxAge?: number;
   push?: (endpoint: string, payload: PushPayload) => Promise<"ok" | "gone" | "error">;
   log?: (msg: string) => void;
+  /** Behind a reverse proxy: the client IP is the last `X-Forwarded-For` entry. */
+  trustProxy?: boolean;
+  /** Accept plain-http push endpoints (otherwise https only). */
+  allowHttpPush?: boolean;
 }
 
 // Close code that tells a Mac its token is unknown (don't keep retrying).
@@ -95,14 +135,35 @@ function safeEqual(a: string, b: string) {
 /** Failed guesses (setup code, pairing code) per IP: 10 per 10 minutes. */
 class Throttle {
   private hits = new Map<string, number[]>();
-  blocked(ip: string) {
+  private lastSweep = 0;
+  /**
+   * Count an attempt before any await, so parallel requests can't all pass the check.
+   * null if the IP is over the limit, else a handle for `forgive`.
+   */
+  attempt(ip: string): number | null {
     const t = now();
+    this.sweep(t);
     const list = (this.hits.get(ip) ?? []).filter((x) => t - x < 600);
+    if (list.length >= 10) {
+      this.hits.set(ip, list);
+      return null;
+    }
+    list.push(t);
     this.hits.set(ip, list);
-    return list.length >= 10;
+    return t;
   }
-  fail(ip: string) {
-    this.hits.set(ip, [...(this.hits.get(ip) ?? []), now()]);
+  /** The guess was right: don't count it. */
+  forgive(ip: string, attempt: number) {
+    const list = this.hits.get(ip) ?? [];
+    const i = list.indexOf(attempt);
+    if (i >= 0) list.splice(i, 1);
+    if (!list.length) this.hits.delete(ip);
+  }
+  /** Forget IPs without recent attempts, at most once a minute (otherwise the map only grows). */
+  private sweep(t: number) {
+    if (t - this.lastSweep < 60) return;
+    this.lastSweep = t;
+    for (const [ip, list] of this.hits) if (!list.some((x) => t - x < 600)) this.hits.delete(ip);
   }
 }
 
@@ -179,7 +240,9 @@ export function createRelay(opts: RelayOptions) {
 
   async function handleHttp(req: Request, srv: Server<WSData>): Promise<Response | undefined> {
     const url = new URL(req.url);
-    const ip = srv.requestIP(req)?.address ?? "?";
+    // Behind the proxy every request comes from it; the proxy appends the real client as the last entry.
+    const forwarded = opts.trustProxy ? req.headers.get("x-forwarded-for")?.split(",").pop()?.trim() : undefined;
+    const ip = forwarded || (srv.requestIP(req)?.address ?? "?");
     const body = async () => {
       try {
         return (await req.json()) as Record<string, unknown>;
@@ -207,13 +270,14 @@ export function createRelay(opts: RelayOptions) {
     }
 
     if (req.method === "POST" && url.pathname === "/api/mac/register") {
-      if (throttle.blocked(ip)) return json({ error: "too many attempts" }, 429);
+      const attempt = throttle.attempt(ip);
+      if (attempt === null) return json({ error: "too many attempts" }, 429);
       const b = await body();
       const ok = typeof b.setupCode === "string" && safeEqual(b.setupCode, opts.setupCode);
       if (!ok || typeof b.machineId !== "string" || !/^[\w-]{8,64}$/.test(b.machineId)) {
-        throttle.fail(ip);
         return json({ error: "wrong setup code" }, 403);
       }
+      throttle.forgive(ip, attempt);
       const token = randomToken();
       const name = typeof b.name === "string" && b.name ? b.name.slice(0, 200) : "Mac";
       store.upsertMachine(b.machineId, name, await sha256(token));
@@ -235,12 +299,13 @@ export function createRelay(opts: RelayOptions) {
     }
 
     if (req.method === "POST" && url.pathname === "/api/device/register") {
-      if (throttle.blocked(ip)) return json({ error: "too many attempts" }, 429);
+      const attempt = throttle.attempt(ip);
+      if (attempt === null) return json({ error: "too many attempts" }, 429);
       const b = await body();
       if (typeof b.code !== "string" || !store.takePairing(b.code.toUpperCase())) {
-        throttle.fail(ip);
         return json({ error: "pairing code is wrong or expired" }, 403);
       }
+      throttle.forgive(ip, attempt);
       const token = randomToken();
       const deviceId = crypto.randomUUID();
       const name = typeof b.name === "string" && b.name ? b.name.slice(0, 200) : "Phone";
@@ -257,9 +322,17 @@ export function createRelay(opts: RelayOptions) {
 
       if (req.method === "POST" && url.pathname === "/api/device/push") {
         const b = await body();
-        const endpoint = typeof b.endpoint === "string" && /^https?:\/\//.test(b.endpoint) ? b.endpoint : null;
+        const endpoint = typeof b.endpoint === "string" ? b.endpoint : null;
+        const error = endpoint === null ? null : pushEndpointError(endpoint, opts.allowHttpPush);
+        if (error) return json({ error: `push endpoint rejected: ${error}` }, 400);
         store.setPushEndpoint(device.id, endpoint);
         return json({ ok: true });
+      }
+      if (req.method === "DELETE" && url.pathname === "/api/device") {
+        store.deleteDevice(device.id);
+        for (const ws of apps) if (ws.data.kind === "app" && ws.data.deviceId === device.id) ws.close(REJECTED, "unpaired");
+        log(`unpaired device ${device.name}`);
+        return new Response(null, { status: 204 });
       }
       if (req.method === "GET" && url.pathname === "/api/machines") {
         return json({ machines: store.machines().map(machineView) });
@@ -285,7 +358,10 @@ export function createRelay(opts: RelayOptions) {
     } catch {
       return;
     }
-    if (!parsed.success) return log(`bad message from Mac ${id}: ${parsed.error.issues[0]?.message}`);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      return log(`bad message from Mac ${id}: ${issue?.path.join(".")}: ${issue?.message}`);
+    }
     const msg = parsed.data;
     const t = now();
     switch (msg.type) {
@@ -343,6 +419,8 @@ export function createRelay(opts: RelayOptions) {
   server = Bun.serve<WSData>({
     port: opts.port ?? 8080,
     hostname: opts.hostname ?? "0.0.0.0",
+    // Only small JSON goes over HTTP; snapshots use the WebSocket.
+    maxRequestBodySize: 64 * 1024,
     fetch: (req, srv) => handleHttp(req, srv),
     websocket: {
       idleTimeout: 90, // Macs ping every 25 s
