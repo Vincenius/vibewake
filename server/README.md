@@ -26,7 +26,7 @@ ntfy.example.com {
 }
 ```
 
-`docker-compose.yml` sets `TRUST_PROXY=1`, so the relay takes the client IP for rate limits from the last `X-Forwarded-For` entry (which Caddy and nginx's `$proxy_add_x_forwarded_for` set). Only set it when the relay is reachable through the proxy alone: exposed directly, anyone can send that header and dodge the rate limit.
+`docker-compose.yml` sets `TRUST_PROXY=1`, so the relay takes the client IP for rate limits from the last `X-Forwarded-For` entry (which Caddy and nginx's `$proxy_add_x_forwarded_for` set). Behind Cloudflare that entry is a Cloudflare edge, so the relay then uses Cloudflare's `CF-Connecting-IP` instead — only when the request came from a Cloudflare address, so the header can't be forged by going around Cloudflare. No proxy config is needed for this. Only set it when the relay is reachable through the proxy alone: exposed directly, anyone can send that header and dodge the rate limit.
 
 WebSockets need no extra proxy settings in Caddy. With nginx, add `proxy_http_version 1.1`, plus the `Upgrade` and `Connection` headers, and a `proxy_read_timeout` above 90 s.
 

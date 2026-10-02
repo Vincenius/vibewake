@@ -1,5 +1,6 @@
 import type { Server, ServerWebSocket } from "bun";
 import { z } from "zod";
+import { clientIP } from "./clientip";
 import { Store, now, type CommandRow, type MachineRow } from "./db";
 import { pushEndpointError, sendPush, type PushPayload } from "./push";
 
@@ -87,7 +88,7 @@ export interface RelayOptions {
   commandMaxAge?: number;
   push?: (endpoint: string, payload: PushPayload) => Promise<"ok" | "gone" | "error">;
   log?: (msg: string) => void;
-  /** Behind a reverse proxy: the client IP is the last `X-Forwarded-For` entry. */
+  /** Behind a reverse proxy: the client IP is the last `X-Forwarded-For` entry (or CF-Connecting-IP via Cloudflare). */
   trustProxy?: boolean;
   /** Accept plain-http push endpoints (otherwise https only). */
   allowHttpPush?: boolean;
@@ -240,9 +241,7 @@ export function createRelay(opts: RelayOptions) {
 
   async function handleHttp(req: Request, srv: Server<WSData>): Promise<Response | undefined> {
     const url = new URL(req.url);
-    // Behind the proxy every request comes from it; the proxy appends the real client as the last entry.
-    const forwarded = opts.trustProxy ? req.headers.get("x-forwarded-for")?.split(",").pop()?.trim() : undefined;
-    const ip = forwarded || (srv.requestIP(req)?.address ?? "?");
+    const ip = clientIP(req.headers, srv.requestIP(req)?.address, !!opts.trustProxy);
     const body = async () => {
       try {
         return (await req.json()) as Record<string, unknown>;

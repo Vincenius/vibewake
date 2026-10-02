@@ -251,6 +251,19 @@ test("with trustProxy the rate limit is per last X-Forwarded-For entry", async (
   expect((await wrongSetup()).status).toBe(403);
 });
 
+test("via Cloudflare the rate limit is per CF-Connecting-IP, only when the proxy saw a Cloudflare edge", async () => {
+  restart({ trustProxy: true });
+  const viaCf = (client: string) => ({ "x-forwarded-for": "172.64.1.1", "cf-connecting-ip": client });
+  for (let i = 0; i < 10; i++) expect((await wrongSetup(viaCf(`1.1.1.${i}`))).status).toBe(403);
+  // Different Cloudflare edges, same client: still limited.
+  expect((await wrongSetup({ "x-forwarded-for": "2606:4700::1", "cf-connecting-ip": "1.1.1.0" })).status).toBe(429);
+  // Same edge, another client: not limited.
+  expect((await wrongSetup(viaCf("8.8.8.8"))).status).toBe(403);
+  // Not from Cloudflare: a forged CF-Connecting-IP is ignored, the proxy's peer counts.
+  for (let i = 0; i < 9; i++) await wrongSetup({ "x-forwarded-for": "5.6.7.8", "cf-connecting-ip": `9.9.9.${i}` });
+  expect((await wrongSetup({ "x-forwarded-for": "5.6.7.8", "cf-connecting-ip": "9.9.9.200" })).status).toBe(429);
+});
+
 test("push endpoints must be https and public", async () => {
   const mac = await registerMac();
   const device = await pairDevice(mac.token);
