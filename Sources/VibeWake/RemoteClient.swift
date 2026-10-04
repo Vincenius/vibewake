@@ -117,6 +117,8 @@ final class RemoteClient: NSObject, ObservableObject, URLSessionWebSocketDelegat
     private var pingTimer: Timer?
     private var lastSnapshot: Data?
     private var opened = false
+    /// Events that happened while disconnected, sent on the next connect (newest 20, at most an hour old).
+    private var pendingEvents: [(at: Date, event: [String: Any])] = []
 
     /// Acks of commands already run, by id, so a command re-sent after a reconnect runs only once.
     private var done: [String: [String: Any]] = [:]
@@ -197,6 +199,9 @@ final class RemoteClient: NSObject, ObservableObject, URLSessionWebSocketDelegat
         send(["type": "hello", "machineId": config.machineId, "name": RemoteConfig.machineName,
               "model": RemoteConfig.model, "appVersion": Self.appVersion])
         pingTimer = Timer.scheduledTimer(withTimeInterval: 25, repeats: true) { [weak self] _ in self?.send(["type": "ping"]) }
+        let pending = pendingEvents.filter { $0.at.timeIntervalSinceNow > -3600 }
+        pendingEvents = []
+        for p in pending { send(["type": "event", "event": p.event]) }
         onConnected?()
     }
 
@@ -282,8 +287,17 @@ final class RemoteClient: NSObject, ObservableObject, URLSessionWebSocketDelegat
         send(["type": "snapshot", "snapshot": obj])
     }
 
+    /// `away`: the lid is closed, so the relay pushes "finished" / "failed" to every phone, not only subscribed ones.
     func sendEvent(kind: String, sessionId: String, title: String, text: String) {
-        send(["type": "event", "event": ["kind": kind, "sessionId": sessionId, "title": title, "text": String(text.prefix(300))]])
+        let away = SleepController.isLidClosed && !SleepController.hasExternalDisplay
+        let event: [String: Any] = ["kind": kind, "sessionId": sessionId, "title": title, "text": String(text.prefix(300)), "away": away]
+        guard config != nil else { return }
+        if status == .connected, task != nil {
+            send(["type": "event", "event": event])
+        } else {
+            pendingEvents.append((Date(), event))
+            if pendingEvents.count > 20 { pendingEvents.removeFirst(pendingEvents.count - 20) }
+        }
     }
 
     func sendSleeping(nextWakeAt: Double?) {

@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.NotificationsNone
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
@@ -61,6 +63,7 @@ import com.vibewake.app.data.QueueItem
 import com.vibewake.app.data.Relay
 import com.vibewake.app.data.RelayState
 import com.vibewake.app.data.Session
+import com.vibewake.app.data.Subscription
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -78,6 +81,7 @@ fun SessionScreen(
     val canControl = machine?.snapshot?.remoteControl != false
     val busy = state.commands.values.any { it.open && it.machineId == machineId && it.sessionId == sessionId }
     var editing by remember { mutableStateOf<QueueItem?>(null) }
+    val subscribed = Subscription(machineId, sessionId) in state.subscriptions
 
     /** Returns whether the command went out (false: offline, keep what the user typed). */
     fun send(type: String, vararg fields: Pair<String, Any?>): Boolean =
@@ -88,6 +92,13 @@ fun SessionScreen(
             TopAppBar(
                 title = { Text(s?.title ?: "Chat", maxLines = 1, overflow = TextOverflow.Ellipsis) },
                 navigationIcon = { IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                // With the lid closed every chat notifies; this makes this one notify while the lid is open too.
+                actions = {
+                    if (s != null) IconButton({ relay.subscribe(machineId, sessionId, !subscribed) }) {
+                        if (subscribed) Icon(Icons.Filled.Notifications, "Stop notifying when this chat finishes")
+                        else Icon(Icons.Filled.NotificationsNone, "Notify when this chat finishes")
+                    }
+                },
             )
         },
         snackbarHost = { SnackbarHost(snackbar) },

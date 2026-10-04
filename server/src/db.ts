@@ -56,6 +56,12 @@ export class Store {
         created_at REAL NOT NULL, updated_at REAL NOT NULL
       );
       CREATE INDEX IF NOT EXISTS commands_open ON commands (machine_id, status, created_at);
+      CREATE TABLE IF NOT EXISTS subscriptions (
+        device_id TEXT NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+        machine_id TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+        session_id TEXT NOT NULL, created_at REAL NOT NULL,
+        PRIMARY KEY (device_id, machine_id, session_id)
+      );
       CREATE TABLE IF NOT EXISTS pairing (
         code TEXT PRIMARY KEY, machine_id TEXT NOT NULL, expires_at REAL NOT NULL
       );
@@ -117,6 +123,38 @@ export class Store {
 
   deleteDevice(id: string) {
     this.db.query("DELETE FROM devices WHERE id = ?").run(id);
+  }
+
+  // Subscriptions: chats a phone wants "finished" / "failed" pushes for even while the Mac's lid is open.
+
+  subscribe(deviceId: string, machineId: string, sessionId: string) {
+    this.db
+      .query("INSERT OR REPLACE INTO subscriptions (device_id, machine_id, session_id, created_at) VALUES (?, ?, ?, ?)")
+      .run(deviceId, machineId, sessionId, now());
+  }
+
+  unsubscribe(deviceId: string, machineId: string, sessionId: string) {
+    this.db.query("DELETE FROM subscriptions WHERE device_id = ? AND machine_id = ? AND session_id = ?").run(deviceId, machineId, sessionId);
+  }
+
+  isSubscribed(deviceId: string, machineId: string, sessionId: string) {
+    return !!this.db
+      .query("SELECT 1 FROM subscriptions WHERE device_id = ? AND machine_id = ? AND session_id = ?")
+      .get(deviceId, machineId, sessionId);
+  }
+
+  subscriptions(deviceId: string) {
+    return this.db
+      .query<{ machine_id: string; session_id: string }, [string]>(
+        "SELECT machine_id, session_id FROM subscriptions WHERE device_id = ? ORDER BY created_at",
+      )
+      .all(deviceId)
+      .map((r) => ({ machineId: r.machine_id, sessionId: r.session_id }));
+  }
+
+  /** Chats come and go: forget subscriptions nobody renewed in 30 days. */
+  pruneSubscriptions() {
+    this.db.query("DELETE FROM subscriptions WHERE created_at < ?").run(now() - 30 * 86400);
   }
 
   // Pairing codes

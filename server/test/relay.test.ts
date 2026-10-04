@@ -202,6 +202,69 @@ test("events become pushes to registered devices", async () => {
   expect(pushes[0].payload.text).toHaveLength(300);
 });
 
+test("with the lid open, only subscribed phones get finished/failed; limited/waiting always go out", async () => {
+  const mac = await registerMac();
+  const device = await pairDevice(mac.token);
+  expect((await post("/api/device/push", { endpoint: "https://ntfy.example.com/upABC?up=1" }, device)).status).toBe(200);
+  const m = connect("/ws/mac", mac.token);
+  await m.opened;
+  const app = connect("/ws/app", device);
+  await app.opened;
+  expect((await app.nextOf("subscriptions")).subscriptions).toEqual([]);
+  const event = (kind: string, sessionId: string, away: boolean) =>
+    m.send({ type: "event", event: { kind, sessionId, title: "t", text: "x", away } });
+
+  event("finished", "claude-1", false);
+  event("failed", "claude-1", false);
+  event("waiting", "claude-1", false);
+  event("limited", "claude-1", false);
+  event("finished", "claude-2", true);
+  await Bun.sleep(50);
+  expect(pushes.map((p) => `${p.payload.kind} ${p.payload.sessionId}`)).toEqual(["waiting claude-1", "limited claude-1", "finished claude-2"]);
+
+  pushes = [];
+  app.send({ type: "subscribe", machineId: mac.machineId, sessionId: "claude-1", on: true });
+  expect((await app.nextOf("subscriptions")).subscriptions).toEqual([{ machineId: mac.machineId, sessionId: "claude-1" }]);
+  event("finished", "claude-1", false);
+  event("finished", "claude-3", false);
+  await Bun.sleep(50);
+  expect(pushes.map((p) => p.payload.sessionId)).toEqual(["claude-1"]);
+
+  app.send({ type: "subscribe", machineId: mac.machineId, sessionId: "claude-1", on: false });
+  expect((await app.nextOf("subscriptions")).subscriptions).toEqual([]);
+});
+
+test("prompts from a phone subscribe it, also to the new chat a newSession starts", async () => {
+  const mac = await registerMac();
+  const device = await pairDevice(mac.token);
+  const m = connect("/ws/mac", mac.token);
+  await m.opened;
+  const app = connect("/ws/app", device);
+  await app.opened;
+  await app.nextOf("subscriptions");
+
+  app.send({ type: "command", ref: "a", machineId: mac.machineId, cmd: { type: "sendNow", sessionId: "claude-1", text: "go" } });
+  expect((await app.nextOf("subscriptions")).subscriptions.map((s: any) => s.sessionId)).toEqual(["claude-1"]);
+
+  m.send({ type: "snapshot", snapshot: { sessions: [{ id: "claude-1", cwd: "/p" }] } });
+  app.send({ type: "command", ref: "b", machineId: mac.machineId, cmd: { type: "newSession", cwd: "/p", prompt: "hi" } });
+  while ((await app.nextOf("commandStatus")).command.ref !== "b");
+  m.send({ type: "snapshot", snapshot: { sessions: [{ id: "claude-1", cwd: "/p" }, { id: "claude-9", cwd: "/q" }] } });
+  m.send({ type: "snapshot", snapshot: { sessions: [{ id: "claude-1", cwd: "/p" }, { id: "claude-9", cwd: "/q" }, { id: "claude-2", cwd: "/p" }] } });
+  expect((await app.nextOf("subscriptions")).subscriptions.map((s: any) => s.sessionId)).toEqual(["claude-1", "claude-2"]);
+});
+
+test("events from Macs that don't send `away` reach every phone", async () => {
+  const mac = await registerMac();
+  const device = await pairDevice(mac.token);
+  expect((await post("/api/device/push", { endpoint: "https://ntfy.example.com/upABC?up=1" }, device)).status).toBe(200);
+  const m = connect("/ws/mac", mac.token);
+  await m.opened;
+  m.send({ type: "event", event: { kind: "finished", sessionId: "claude-1", title: "t", text: "x" } });
+  await Bun.sleep(50);
+  expect(pushes).toHaveLength(1);
+});
+
 test("old open commands expire", async () => {
   restart({ commandMaxAge: -1 });
   const mac = await registerMac();

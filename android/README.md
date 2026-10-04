@@ -8,7 +8,7 @@ Watch and drive VibeWake on your Macs from your phone. The app:
 - lets you add, edit, reorder and delete queued prompts;
 - sends prompts and runs Ask for status, Continue and Resume;
 - starts new chats in a project folder;
-- shows notifications when a chat finishes, hits a usage limit, or waits for you.
+- shows notifications when a chat hits a usage limit or waits for you, and when it finishes or fails while the Mac's lid is closed. With the lid open, you only get "finished" for chats you subscribed to: tap the bell on a chat. Sending a prompt from the phone subscribes you to that chat.
 
 It needs the relay from [../server](../server/README.md). Kotlin and Jetpack Compose, minimum Android 8.0 (API 26).
 

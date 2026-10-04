@@ -46,7 +46,11 @@ data class RelayState(
     val commands: Map<String, CommandRecord> = emptyMap(),
     /** Full replies fetched with "Load full reply", by session id. */
     val fullReplies: Map<String, FullReply> = emptyMap(),
+    /** Chats this phone gets "finished" / "failed" notifications for even while the Mac's lid is open. */
+    val subscriptions: Set<Subscription> = emptySet(),
 )
+
+data class Subscription(val machineId: String, val sessionId: String)
 
 /** A fetched full reply; [at] matches the snapshot's `reply.at` while it's still the latest one. */
 data class FullReply(val text: String, val at: Double)
@@ -174,6 +178,13 @@ class Relay(private val credentials: Credentials) {
                 val c = json.decodeFromJsonElement<CommandRecord>(obj["command"]!!)
                 onCommand(c)
             }
+            "subscriptions" -> {
+                val list = obj["subscriptions"]!!.jsonArray.map {
+                    val o = it.jsonObject
+                    Subscription(o["machineId"]!!.jsonPrimitive.content, o["sessionId"]!!.jsonPrimitive.content)
+                }
+                _state.update { s -> s.copy(subscriptions = list.toSet()) }
+            }
             "error" -> obj["error"]?.jsonPrimitive?.content?.let { _messages.tryEmit(it) }
         }
     }
@@ -242,6 +253,19 @@ class Relay(private val credentials: Credentials) {
             }
         }, ACK_TIMEOUT_MS)
         return ref
+    }
+
+    /** Get (or stop getting) "finished" / "failed" notifications for a chat while the Mac's lid is open. */
+    fun subscribe(machineId: String, sessionId: String, on: Boolean) {
+        val msg = buildJsonObject {
+            put("type", "subscribe")
+            put("machineId", machineId)
+            put("sessionId", sessionId)
+            put("on", on)
+        }
+        if (_state.value.connection != Connection.Online || socket?.send(msg.toString()) != true) {
+            _messages.tryEmit("Not connected to the relay")
+        }
     }
 
     fun command(type: String, vararg fields: Pair<String, Any?>): JsonObject = buildJsonObject {

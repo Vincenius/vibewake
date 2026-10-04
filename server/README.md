@@ -1,6 +1,6 @@
 # VibeWake relay
 
-A small server that connects VibeWake on your Macs to the Android app. Both sides connect out to it over WebSockets, so neither the Macs nor the phone need to be reachable. It keeps commands the phone sends to a sleeping Mac until that Mac checks in, and forwards events (chat finished, usage limit, waiting for input) as push notifications through [ntfy](https://ntfy.sh).
+A small server that connects VibeWake on your Macs to the Android app. Both sides connect out to it over WebSockets, so neither the Macs nor the phone need to be reachable. It keeps commands the phone sends to a sleeping Mac until that Mac checks in, and forwards events (chat finished, usage limit, waiting for input) as push notifications through [ntfy](https://ntfy.sh). "Finished" and "failed" go to every phone only while the Mac's lid is closed; with the lid open, only to phones subscribed to that chat (see [PROTOCOL.md](../protocol/PROTOCOL.md#push-notifications)).
 
 It is a single [Bun](https://bun.sh) process with a SQLite file. The message format is in [../protocol/PROTOCOL.md](../protocol/PROTOCOL.md).
 

@@ -112,7 +112,7 @@ Claude Code (v2.1.224 or later) gives each session an inbox socket for [cross-se
 
 ## Phone app
 
-An Android app can watch and drive VibeWake on all your Macs: see each chat's state and last reply, edit queues, send prompts, start new chats, and get a notification when a chat finishes, hits a usage limit or waits for you. Macs and the phone talk through a small relay server you host ([server/](server/README.md)); neither needs to be reachable from the internet.
+An Android app can watch and drive VibeWake on all your Macs: see each chat's state and last reply, edit queues, send prompts, start new chats, and get a notification when a chat hits a usage limit or waits for you, or finishes while the lid is closed (or while you've subscribed to it from the phone). Macs and the phone talk through a small relay server you host ([server/](server/README.md)); neither needs to be reachable from the internet.
 
 ```
 Android app ──WSS──► relay (server/) ◄──WSS── VibeWake on each Mac

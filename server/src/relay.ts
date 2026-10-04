@@ -67,7 +67,14 @@ const MacMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("ping") }),
   z.object({
     type: z.literal("event"),
-    event: z.object({ kind: z.enum(["finished", "failed", "limited", "waiting"]), sessionId: z.string(), title: z.string(), text: z.string() }),
+    event: z.object({
+      kind: z.enum(["finished", "failed", "limited", "waiting"]),
+      sessionId: z.string(),
+      title: z.string(),
+      text: z.string(),
+      // Lid closed (no external display). Macs that don't send it notify every phone, as before.
+      away: z.boolean().default(true),
+    }),
   }),
   z.object({ type: z.literal("ack"), id: z.string(), ok: z.boolean(), error: z.string().optional(), result: z.unknown().optional() }),
   z.object({ type: z.literal("sleeping"), nextWakeAt: z.number().nullable() }),
@@ -75,7 +82,13 @@ const MacMessage = z.discriminatedUnion("type", [
 
 const AppMessage = z.discriminatedUnion("type", [
   z.object({ type: z.literal("command"), ref: z.string().max(100).nullable().default(null), machineId: z.string(), cmd: Command }),
+  z.object({ type: z.literal("subscribe"), machineId: z.string(), sessionId, on: z.boolean() }),
 ]);
+
+/** Prompts sent from a phone subscribe it to the chat they go to. */
+const subscribing = new Set(["queueAdd", "sendNow", "askStatus", "continue", "resumeQueue"]);
+/** How long a phone waits for the new chat a newSession / "new chat" prompt starts in a folder. */
+const NEW_CHAT_WATCH = 24 * 3600;
 
 type WSData = { kind: "mac"; machineId: string } | { kind: "app"; deviceId: string } | { kind: "rejected" };
 
@@ -176,6 +189,8 @@ export function createRelay(opts: RelayOptions) {
   const throttle = new Throttle();
   const macs = new Map<string, ServerWebSocket<WSData>>();
   const apps = new Set<ServerWebSocket<WSData>>();
+  /** Phones waiting for a new chat in a folder, to subscribe to it once a snapshot shows it. */
+  let newChatWatches: { deviceId: string; machineId: string; cwd: string; until: number }[] = [];
   let server: Server<WSData>;
 
   const machineView = (m: MachineRow) => ({
@@ -213,12 +228,55 @@ export function createRelay(opts: RelayOptions) {
     if (c) toApps({ type: "commandStatus", command: commandView(c) });
   };
 
+  const sendSubscriptions = (deviceId: string) => {
+    const s = JSON.stringify({ type: "subscriptions", subscriptions: store.subscriptions(deviceId) });
+    for (const ws of apps) if (ws.data.kind === "app" && ws.data.deviceId === deviceId) ws.send(s);
+  };
+
+  const sessionsOf = (snapshotJson: string | null): { id: string; cwd?: string | null }[] => {
+    if (!snapshotJson) return [];
+    return JSON.parse(snapshotJson).sessions ?? [];
+  };
+
+  /** Subscribe phones to chats that just appeared in a folder they're watching. */
+  function matchNewChats(machineId: string, before: string | null, after: { sessions?: { id: string; cwd?: string | null }[] }) {
+    const t = now();
+    newChatWatches = newChatWatches.filter((w) => w.until > t);
+    if (!newChatWatches.some((w) => w.machineId === machineId)) return;
+    const known = new Set(sessionsOf(before).map((s) => s.id));
+    for (const s of after.sessions ?? []) {
+      if (known.has(s.id) || !s.cwd) continue;
+      const i = newChatWatches.findIndex((w) => w.machineId === machineId && w.cwd === s.cwd);
+      if (i < 0) continue;
+      const [w] = newChatWatches.splice(i, 1);
+      store.subscribe(w.deviceId, machineId, s.id);
+      sendSubscriptions(w.deviceId);
+    }
+  }
+
+  function autoSubscribe(deviceId: string, machine: MachineRow, cmd: z.infer<typeof Command>) {
+    const newChatIn = (cwd: string | null | undefined) => {
+      if (cwd) newChatWatches.push({ deviceId, machineId: machine.id, cwd, until: now() + NEW_CHAT_WATCH });
+    };
+    if (cmd.type === "newSession") return newChatIn(cmd.cwd);
+    if (cmd.type === "queueAdd" && cmd.mode === "newChat") {
+      return newChatIn(sessionsOf(machine.snapshot_json).find((s) => s.id === cmd.sessionId)?.cwd);
+    }
+    if (!subscribing.has(cmd.type) || !("sessionId" in cmd)) return;
+    store.subscribe(deviceId, machine.id, cmd.sessionId);
+    sendSubscriptions(deviceId);
+  }
+
   const deliver = (ws: ServerWebSocket<WSData>, c: CommandRow) => {
     ws.send(JSON.stringify({ type: "command", id: c.id, cmd: JSON.parse(c.cmd_json) }));
     if (c.status === "pending") broadcastCommand(store.setCommandStatus(c.id, "delivered"));
   };
 
-  async function notify(machine: MachineRow, ev: { kind: string; sessionId: string; title: string; text: string }) {
+  /**
+   * "finished" and "failed" go to a phone only while the Mac is away (lid closed) or when the phone
+   * subscribed to the chat; "limited" and "waiting" always do, since the chat is stuck until someone acts.
+   */
+  async function notify(machine: MachineRow, ev: { kind: string; sessionId: string; title: string; text: string; away: boolean }) {
     const payload: PushPayload = {
       machineId: machine.id,
       machineName: machine.name,
@@ -229,10 +287,14 @@ export function createRelay(opts: RelayOptions) {
     };
     for (const d of store.devices()) {
       if (!d.push_endpoint) continue;
+      const always = ev.kind === "limited" || ev.kind === "waiting";
+      if (!always && !ev.away && !store.isSubscribed(d.id, machine.id, ev.sessionId)) continue;
       const r = await push(d.push_endpoint, payload);
       if (r === "gone") {
         log(`push endpoint of device ${d.name} is gone; removed`);
         store.setPushEndpoint(d.id, null);
+      } else if (r === "error") {
+        log(`push to device ${d.name} failed`);
       }
     }
   }
@@ -368,10 +430,13 @@ export function createRelay(opts: RelayOptions) {
         store.updateMachine(id, { name: msg.name, model: msg.model, last_seen: t, sleeping: 0, next_wake_at: null });
         broadcastMachine(id);
         break;
-      case "snapshot":
+      case "snapshot": {
+        const before = store.machine(id)?.snapshot_json ?? null;
         store.updateMachine(id, { snapshot_json: JSON.stringify({ ...msg.snapshot, at: t }), last_seen: t });
+        matchNewChats(id, before, msg.snapshot);
         broadcastMachine(id);
         break;
+      }
       case "ping":
         store.updateMachine(id, { last_seen: t });
         break;
@@ -393,7 +458,7 @@ export function createRelay(opts: RelayOptions) {
     }
   }
 
-  function onAppMessage(ws: ServerWebSocket<WSData>, raw: string) {
+  function onAppMessage(ws: ServerWebSocket<WSData> & { data: { kind: "app" } }, raw: string) {
     let parsed;
     try {
       parsed = AppMessage.safeParse(JSON.parse(raw));
@@ -405,10 +470,20 @@ export function createRelay(opts: RelayOptions) {
       return;
     }
     const msg = parsed.data;
-    if (!store.machine(msg.machineId)) {
+    const deviceId = ws.data.deviceId;
+    const machine = store.machine(msg.machineId);
+    if (msg.type === "subscribe") {
+      if (!machine) return ws.send(JSON.stringify({ type: "error", error: "unknown machine" }));
+      if (msg.on) store.subscribe(deviceId, msg.machineId, msg.sessionId);
+      else store.unsubscribe(deviceId, msg.machineId, msg.sessionId);
+      sendSubscriptions(deviceId);
+      return;
+    }
+    if (!machine) {
       ws.send(JSON.stringify({ type: "error", ref: msg.ref, error: "unknown machine" }));
       return;
     }
+    autoSubscribe(deviceId, machine, msg.cmd);
     const c = store.addCommand({ id: crypto.randomUUID(), ref: msg.ref, machineId: msg.machineId, cmd: msg.cmd });
     broadcastCommand(c);
     const mac = macs.get(msg.machineId);
@@ -439,12 +514,13 @@ export function createRelay(opts: RelayOptions) {
           apps.add(ws);
           ws.send(JSON.stringify({ type: "machines", machines: store.machines().map(machineView) }));
           ws.send(JSON.stringify({ type: "commands", commands: store.recentCommands().map(commandView) }));
+          ws.send(JSON.stringify({ type: "subscriptions", subscriptions: store.subscriptions(ws.data.deviceId) }));
         }
       },
       message(ws, message) {
         const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
         if (ws.data.kind === "mac") onMacMessage(ws as any, raw);
-        else if (ws.data.kind === "app") onAppMessage(ws, raw);
+        else if (ws.data.kind === "app") onAppMessage(ws as any, raw);
       },
       close(ws) {
         if (ws.data.kind === "mac") {
@@ -464,6 +540,7 @@ export function createRelay(opts: RelayOptions) {
   const housekeeping = setInterval(() => {
     for (const c of store.expireCommands(commandMaxAge)) broadcastCommand(c);
     store.pruneCommands();
+    store.pruneSubscriptions();
   }, 60_000);
 
   return {

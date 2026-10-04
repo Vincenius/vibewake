@@ -25,7 +25,7 @@ Mac → relay:
 - `{type:"hello", machineId, name, model, appVersion}` — first message after connecting.
 - `{type:"snapshot", snapshot: Snapshot}` — whenever it changes. The relay drops (and logs) a snapshot that doesn't match `Snapshot` below: a session needs `id`, a queue item `id` and `text`, a reply `text`, a battery both fields. Other fields may be left out (nullable ones may be `null`) but must have the documented type; unknown fields are passed through.
 - `{type:"ping"}` — every 25 s, keeps `lastSeen` fresh.
-- `{type:"event", event: {kind, sessionId, title, text}}`. `kind` is one of `finished | failed | limited | waiting`.
+- `{type:"event", event: {kind, sessionId, title, text, away}}`. `kind` is one of `finished | failed | limited | waiting`. `away` is true while the lid is closed and no external display is attached (missing counts as `true`). Events that happen while disconnected are sent after the next `hello` (the newest 20, up to an hour old). See [Push notifications](#push-notifications).
 - `{type:"ack", id, ok, error?, result?}` — the outcome of one command.
 - `{type:"sleeping", nextWakeAt: number | null}` — sent just before the Mac sleeps.
 
@@ -40,9 +40,11 @@ Relay → app:
 - `{type:"machine", machine: Machine}` — when a Mac's state or snapshot changes.
 - `{type:"commands", commands: CommandRecord[]}` — recent commands, on connect.
 - `{type:"commandStatus", command: CommandRecord}` — on every status change.
+- `{type:"subscriptions", subscriptions: {machineId, sessionId}[]}` — this phone's subscriptions, on connect and whenever they change.
 
 App → relay:
 - `{type:"command", ref, machineId, cmd: Command}` — `ref` is the app's own id. It is echoed in the `CommandRecord`.
+- `{type:"subscribe", machineId, sessionId, on: boolean}` — subscribe to a chat, or unsubscribe (`on: false`).
 
 ## Types
 
@@ -92,5 +94,13 @@ CommandRecord = { id, ref: string | null, machineId, cmd: Command,
 
 A pending command expires after 24 hours.
 
+## Push notifications
+
 Push notifications are sent to each device's UnifiedPush endpoint as a JSON body:
 `{machineId, machineName, sessionId, kind, title, text}`. `text` is at most 300 characters.
+
+Which phones get an event:
+- `limited` and `waiting`: every phone with a push endpoint.
+- `finished` and `failed`: every phone if the event has `away: true`. Otherwise only phones subscribed to that chat.
+
+The relay subscribes a phone automatically when the phone sends `queueAdd`, `sendNow`, `askStatus`, `continue` or `resumeQueue` for a chat. After `newSession`, or `queueAdd` with `mode: "newChat"`, it subscribes the phone to the next new chat a snapshot shows in that folder (within 24 hours). Subscriptions are dropped after 30 days, when the phone unpairs, and when the Mac is removed.
