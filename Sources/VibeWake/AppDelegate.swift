@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let monitor = ActivityMonitor()
     private let sleep = SleepController()
     private let autopilot = Autopilot()
+    private let reaper = SessionReaper()
     private var statusItem: NSStatusItem!
     private var timer: Timer?
     private var dirWatcher: DispatchSourceFileSystemObject?
@@ -30,8 +31,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private lazy var remote = RemoteBridge(autopilot: autopilot)
     /// After a wake, stay up until the relay has handed over pending commands (or this deadline).
     private var checkIn: (deadline: Double, syncedAt: Double?, scheduled: Bool)?
-    /// When our scheduled wake is due, so a wake around then counts as "woke to check in".
-    private var pendingWakeAt: Double?
+    /// When our scheduled wake is due and what for, so a wake around then counts as "woke to check in".
+    private var pendingWake: (at: Double, why: String)?
     /// On battery below this, don't wake up just to check in.
     static let checkInMinBattery = 20
     /// Check-ins in a row that timed out: the wake interval doubles with each (relay unreachable).
@@ -42,6 +43,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Log.write("app", "VibeWake started\(paused ? " (paused)" : "")")
         sleep.recoverFromPreviousRun()
         lidSupport = sleep.lidSupportAvailable
+        // Keep the instructions in ~/.claude/CLAUDE.md current with this version.
+        if Installer.claudeHooksInstalled, (try? Installer.installClaudeInstructions()) == true {
+            Log.write("app", "Updated the VibeWake block in ~/.claude/CLAUDE.md")
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.imagePosition = .imageLeading
@@ -88,6 +93,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         items = monitor.evaluate()
         logSessionChanges()
         autopilot.tick()
+        reaper.update(autopilot.sessions, enabled: autopilot.settings.closeLeftovers)
         remote.update()
         checkLid()
         if finishCheckIn(now: now) { return }
@@ -139,38 +145,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let idle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: CGEventType(rawValue: ~0)!)
         failedCheckIns = synced ? 0 : failedCheckIns + 1
         Log.write("remote", synced ? "Check-in done" : "Check-in timed out (server unreachable?)")
-        // Woke only to check in, nothing came up, and nobody is using the Mac: sleep right away.
-        guard c.scheduled, items.isEmpty, autopilot.keepAwakeReasons.isEmpty, idle > 120 else { return false }
+        // Woke only to check in, nothing came up, and nobody is using the Mac: sleep right away
+        // (not when a chat is about to continue after its usage limit).
+        guard c.scheduled, items.isEmpty, autopilot.keepAwakeReasons.isEmpty, idle > 120,
+              continueAfterLimitAt().map({ $0 - now > 120 }) ?? true else { return false }
         if sleep.isHolding { sleep.release(sleepIfLidClosed: false) }
         lastActiveAt = 0
         sleep.sleepNow()
         return true
     }
 
-    /// Before sleeping: wake up again in a while to pick up prompts sent from the phone.
+    /// Before sleeping: wake up again in a while to pick up prompts sent from the phone (more often by day
+    /// than at night, see AutopilotSettings.nextCheckIn), or when a chat can continue after its usage limit.
     private func scheduleCheckInWake() {
-        guard remote.client.config != nil else { return }
-        // Back off while the relay is unreachable: 2×, 4×, 8×… the interval, at most 4 hours (or the interval itself).
-        let base = autopilot.settings.wakeIntervalMinutes
-        let minutes = min(base * pow(2, Double(min(failedCheckIns, 6))), max(base, 240))
-        var next: Double?
-        if base > 0, !remote.client.rejected,
-           !(SleepController.battery.map { $0.onBattery && $0.percent < Self.checkInMinBattery } ?? false) {
-            let at = Date().addingTimeInterval(minutes * 60)
-            if sleep.scheduleWake(at: at) { next = at.timeIntervalSince1970 }
+        let now = Date()
+        var wakes: [(at: Date, why: String)] = []
+        // Backs off while the relay is unreachable: 2×, 4×, 8×… the interval.
+        if remote.client.config != nil, !remote.client.rejected,
+           let at = autopilot.settings.nextCheckIn(after: now, backoff: failedCheckIns) {
+            wakes.append((at, "to check for prompts from the phone"))
         }
-        pendingWakeAt = next
-        remote.client.sendSleeping(nextWakeAt: next)
+        if !paused, let at = continueAfterLimitAt() {
+            wakes.append((max(Date(timeIntervalSince1970: at), now.addingTimeInterval(60)), "to continue after the usage limit"))
+        }
+        var next: (at: Double, why: String)?
+        if let wake = wakes.min(by: { $0.at < $1.at }) {
+            if let b = SleepController.battery, b.onBattery, b.percent < Self.checkInMinBattery {
+                Log.write("sleep", "No wake scheduled \(wake.why): battery at \(b.percent)%")
+            } else if sleep.scheduleWake(at: wake.at, why: wake.why) {
+                next = (wake.at.timeIntervalSince1970, wake.why)
+            }
+        } else if remote.client.config != nil {
+            Log.write("sleep", "No wake scheduled: checking for phone requests is off \(autopilot.settings.isNight(now) ? "at night" : "by day")")
+        }
+        pendingWake = next
+        remote.client.sendSleeping(nextWakeAt: next?.at)
+    }
+
+    /// The earliest time a chat continues after its usage limit (a headless one of the phone too), if any.
+    private func continueAfterLimitAt() -> Double? {
+        let s = autopilot.settings
+        guard s.autoContinue else { return nil }
+        let headless = s.remoteControl ? remote.headless.chats.filter { $0.failed == nil }.compactMap(remote.headless.continueAt) : []
+        return ([autopilot.nextContinueAt].compactMap { $0 } + headless).min()
     }
 
     private func startCheckIn() {
         let now = Date().timeIntervalSince1970
-        let scheduled = pendingWakeAt.map { abs(now - $0) < 120 } ?? false
-        pendingWakeAt = nil
+        let wake = pendingWake.flatMap { abs(now - $0.at) < 120 ? $0 : nil }
+        pendingWake = nil
         sleep.cancelWake() // woke early (or on time): don't wake again for that one
+        if let wake { Log.write("system", "Woke up \(wake.why)") }
         guard remote.client.config != nil, !remote.client.rejected else { return }
-        if scheduled { Log.write("remote", "Woke up to check in with the phone app") }
-        checkIn = (deadline: now + 60, syncedAt: nil, scheduled: scheduled)
+        checkIn = (deadline: now + 60, syncedAt: nil, scheduled: wake != nil)
         remote.client.reconnectNow()
     }
 
@@ -305,6 +332,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(action(lidSupport ? "Enable Scheduled Wake (for the phone app)…" : "Enable Lid-Closed Support…", #selector(installSudoers)))
         }
         menu.addItem(disabled("Phone app: " + remoteStatusText))
+        if remote.client.config != nil { menu.addItem(checkInMenu()) }
         let claude = Installer.claudeHooksInstalled ? "✓" : "–"
         let pi = Installer.piExtensionInstalled ? "✓" : "–"
         menu.addItem(disabled("Integrations: Claude Code \(claude)  pi \(pi)"))
@@ -322,6 +350,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(logs)
         menu.addItem(action("Open Marker Folder", #selector(openMarkers)))
         menu.addItem(NSMenuItem(title: "Quit VibeWake", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
+    }
+
+    /// How often a sleeping Mac wakes to pick up what the phone sent, by day and at night.
+    private func checkInMenu() -> NSMenuItem {
+        let s = autopilot.settings
+        let item = NSMenuItem(title: "Check for Phone Requests", action: nil, keyEquivalent: "")
+        let sub = NSMenu()
+        sub.addItem(disabled("While asleep, wake up to check:"))
+        func section(_ title: String, current: Double, _ sel: Selector) {
+            sub.addItem(disabled(title))
+            for minutes in Set(AutopilotSettings.wakeIntervalChoices + [current]).sorted() {
+                let text = AutopilotSettings.describeInterval(minutes)
+                let mi = action(text.prefix(1).uppercased() + text.dropFirst(), sel)
+                mi.tag = Int(minutes)
+                mi.state = minutes == current ? .on : .off
+                mi.indentationLevel = 1
+                sub.addItem(mi)
+            }
+        }
+        section("By day", current: s.wakeIntervalMinutes, #selector(setDayCheckIn(_:)))
+        sub.addItem(.separator())
+        section("At night (\(s.nightHours))", current: s.nightWakeIntervalMinutes, #selector(setNightCheckIn(_:)))
+        item.submenu = sub
+        return item
     }
 
     private var remoteStatusText: String {
@@ -359,6 +411,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UserDefaults.standard.set(paused, forKey: "paused")
         Log.write("app", paused ? "Paused by user" : "Resumed by user")
         tick()
+    }
+
+    @objc private func setDayCheckIn(_ sender: NSMenuItem) {
+        autopilot.settings.wakeIntervalMinutes = Double(sender.tag)
+        Log.write("app", "Check for phone requests by day: \(AutopilotSettings.describeInterval(Double(sender.tag)))")
+    }
+
+    @objc private func setNightCheckIn(_ sender: NSMenuItem) {
+        autopilot.settings.nightWakeIntervalMinutes = Double(sender.tag)
+        Log.write("app", "Check for phone requests at night: \(AutopilotSettings.describeInterval(Double(sender.tag)))")
     }
 
     @objc private func installSudoers() {

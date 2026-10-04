@@ -113,7 +113,7 @@ final class RemoteBridge {
         let battery = SleepController.battery.map { RemoteSnapshot.Battery(onBattery: $0.onBattery, percent: $0.percent) }
         return RemoteSnapshot(paused: isPaused(), remoteControl: settings.remoteControl, lidClosed: SleepController.isLidClosed,
                               battery: battery, nobodyAtScreen: HeadlessRunner.nobodyAtScreen,
-                              wakeIntervalMinutes: settings.wakeIntervalMinutes, projects: ProjectStore.list(settings), sessions: sessions)
+                              wakeIntervalMinutes: settings.wakeInterval(at: Date()), projects: ProjectStore.list(settings), sessions: sessions)
     }
 
     private static func name(_ state: AgentSession.State) -> String {
@@ -128,7 +128,7 @@ final class RemoteBridge {
 
     private static func since(_ s: AgentSession) -> Double? {
         switch s.state {
-        case .working: return s.turn?.startedAt ?? s.startedAt
+        case .working: return s.turn?.startedAt ?? s.backgroundSince ?? s.startedAt
         case .idle: return s.presence?.lastStopAt
         case .limited: return s.presence?.lastStopAt
         case .stalled(let t), .waiting(let t): return t

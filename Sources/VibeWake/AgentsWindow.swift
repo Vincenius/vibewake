@@ -223,6 +223,8 @@ private struct SettingsBar: View {
             Toggle("Continue after usage limit", isOn: $autopilot.settings.autoContinue)
             Toggle("Nudge after \(Int(autopilot.settings.stallMinutes)) min silence", isOn: $autopilot.settings.stallNudge)
             Toggle("Run queues", isOn: $autopilot.settings.queueEnabled)
+            Toggle("Close leftovers", isOn: $autopilot.settings.closeLeftovers)
+                .help("When a chat ends (closed, /clear, crashed), stop the dev servers, watchers and background tasks it started")
             Spacer()
             Button("Settings File") { NSWorkspace.shared.activateFileViewerSelecting([AutopilotSettings.url]) }
                 .help("Prompts, stall minutes and editor scheme live in settings.json")
@@ -243,29 +245,37 @@ private struct RemoteBar: View {
     @State private var pairing: (link: String, expiresAt: Double)?
 
     var body: some View {
-        HStack(spacing: 12) {
-            Text("Phone app").fontWeight(.medium)
-            if let config = client.config {
-                Circle().fill(statusColor).frame(width: 8, height: 8)
-                Text(statusText(config)).font(.callout).foregroundStyle(.secondary).lineLimit(1)
-                Spacer()
-                Toggle("Allow remote control", isOn: $autopilot.settings.remoteControl)
-                    .help("Off: the phone can only watch. It can't send prompts, edit queues or start chats.")
-                Picker("Wake to check in", selection: $autopilot.settings.wakeIntervalMinutes) {
-                    Text("never").tag(0.0)
-                    ForEach([5.0, 10, 15, 30, 60], id: \.self) { Text("every \(Int($0)) min").tag($0) }
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 12) {
+                Text("Phone app").fontWeight(.medium)
+                if let config = client.config {
+                    Circle().fill(statusColor).frame(width: 8, height: 8)
+                    Text(statusText(config)).font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer()
+                    Toggle("Allow remote control", isOn: $autopilot.settings.remoteControl)
+                        .help("Off: the phone can only watch. It can't send prompts, edit queues or start chats.")
+                    Button("Pair Phone…") { pair(config) }.disabled(busy)
+                    Button("Disconnect") { RemoteConfig.remove(); client.reloadConfig() }
+                } else {
+                    TextField("https://relay.example.com", text: $server).frame(width: 240)
+                    SecureField("Setup code", text: $setupCode).frame(width: 140)
+                    Button("Connect") { register() }
+                        .disabled(busy || server.isEmpty || setupCode.isEmpty)
+                    if let error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(2) }
+                    Spacer()
                 }
-                .frame(width: 210)
-                .help("While asleep, wake this often to pick up prompts sent from the phone")
-                Button("Pair Phone…") { pair(config) }.disabled(busy)
-                Button("Disconnect") { RemoteConfig.remove(); client.reloadConfig() }
-            } else {
-                TextField("https://relay.example.com", text: $server).frame(width: 240)
-                SecureField("Setup code", text: $setupCode).frame(width: 140)
-                Button("Connect") { register() }
-                    .disabled(busy || server.isEmpty || setupCode.isEmpty)
-                if let error { Text(error).font(.caption).foregroundStyle(.red).lineLimit(2) }
-                Spacer()
+            }
+            if client.config != nil {
+                HStack(spacing: 12) {
+                    Text("While asleep, check for phone requests").foregroundStyle(.secondary)
+                    intervalPicker($autopilot.settings.wakeIntervalMinutes)
+                    Text("· at night (\(autopilot.settings.nightHours))").foregroundStyle(.secondary)
+                    intervalPicker($autopilot.settings.nightWakeIntervalMinutes)
+                    Spacer()
+                }
+                .font(.callout)
+                .help("A sleeping Mac can't be reached: it wakes this often to pick up what the phone sent, then sleeps again. "
+                      + "The night hours are nightStartHour and nightEndHour in settings.json.")
             }
         }
         .toggleStyle(.checkbox)
@@ -273,6 +283,16 @@ private struct RemoteBar: View {
         .sheet(isPresented: Binding(get: { pairing != nil }, set: { if !$0 { pairing = nil } })) {
             if let p = pairing { PairSheet(link: p.link, expiresAt: p.expiresAt) { pairing = nil } }
         }
+    }
+
+    private func intervalPicker(_ selection: Binding<Double>) -> some View {
+        Picker("", selection: selection) {
+            ForEach(Array(Set(AutopilotSettings.wakeIntervalChoices + [selection.wrappedValue])).sorted(), id: \.self) {
+                Text(AutopilotSettings.describeInterval($0)).tag($0)
+            }
+        }
+        .labelsHidden()
+        .fixedSize()
     }
 
     private var statusColor: Color {

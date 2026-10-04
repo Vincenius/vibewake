@@ -17,6 +17,10 @@ struct AutopilotSettings: Codable, Equatable {
     var remoteControl = true
     /// While asleep, wake every this many minutes to pick up prompts from the phone (0 = never).
     var wakeIntervalMinutes: Double = 15
+    /// The same at night, from nightStartHour to nightEndHour (local time, whole hours).
+    var nightWakeIntervalMinutes: Double = 60
+    var nightStartHour = 23
+    var nightEndHour = 6
     /// Where chats the phone starts run: "auto" (editor tab if someone could see it, else headless), "headless", "editor".
     var remoteNewChats = "auto"
     /// --permission-mode for chats the phone starts while nobody is at the Mac.
@@ -25,6 +29,8 @@ struct AutopilotSettings: Codable, Equatable {
     var claudePath = ""
     /// Extra project folders the phone may start chats in (besides folders of recent chats).
     var remoteProjects: [String] = []
+    /// When a chat ends (closed, /clear, crashed), stop what it left running: dev servers, watchers, background tasks.
+    var closeLeftovers = true
 
     static var url: URL { Paths.state.appendingPathComponent("settings.json") }
 
@@ -43,10 +49,14 @@ struct AutopilotSettings: Codable, Equatable {
         if let v = obj["editorScheme"] as? String, !v.isEmpty { s.editorScheme = v }
         if let v = obj["remoteControl"] as? Bool { s.remoteControl = v }
         if let v = obj["wakeIntervalMinutes"] as? Double, v >= 0 { s.wakeIntervalMinutes = v == 0 ? 0 : max(5, v) }
+        if let v = obj["nightWakeIntervalMinutes"] as? Double, v >= 0 { s.nightWakeIntervalMinutes = v == 0 ? 0 : max(5, v) }
+        if let v = obj["nightStartHour"] as? Int, (0...23).contains(v) { s.nightStartHour = v }
+        if let v = obj["nightEndHour"] as? Int, (0...23).contains(v) { s.nightEndHour = v }
         if let v = obj["remoteNewChats"] as? String, ["auto", "headless", "editor"].contains(v) { s.remoteNewChats = v }
         if let v = obj["headlessPermissionMode"] as? String, !v.isEmpty { s.headlessPermissionMode = v }
         if let v = obj["claudePath"] as? String { s.claudePath = v }
         if let v = obj["remoteProjects"] as? [String] { s.remoteProjects = v }
+        if let v = obj["closeLeftovers"] as? Bool { s.closeLeftovers = v }
         return s
     }
 
@@ -55,6 +65,48 @@ struct AutopilotSettings: Codable, Equatable {
         let enc = JSONEncoder()
         enc.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? enc.encode(self) { try? data.write(to: Self.url, options: .atomic) }
+    }
+
+    // MARK: Check-in schedule (phone app)
+
+    /// Choices offered for the check-in intervals, in minutes (0 = never).
+    static let wakeIntervalChoices: [Double] = [0, 5, 10, 15, 20, 30, 60, 120]
+
+    static func describeInterval(_ minutes: Double) -> String {
+        switch minutes {
+        case 0: return "never"
+        case 60: return "every hour"
+        case let m where m > 60 && m.truncatingRemainder(dividingBy: 60) == 0: return "every \(Int(m / 60)) hours"
+        default: return "every \(Int(minutes)) min"
+        }
+    }
+
+    var nightHours: String { String(format: "%02d:00–%02d:00", nightStartHour, nightEndHour) }
+
+    func isNight(_ date: Date) -> Bool {
+        guard nightStartHour != nightEndHour else { return false }
+        let h = Calendar.current.component(.hour, from: date)
+        return nightStartHour < nightEndHour ? (nightStartHour..<nightEndHour).contains(h) : h >= nightStartHour || h < nightEndHour
+    }
+
+    /// Minutes between check-in wakes at that time (0 = none).
+    func wakeInterval(at date: Date) -> Double { isNight(date) ? nightWakeIntervalMinutes : wakeIntervalMinutes }
+
+    /// When to wake from sleep next to check in with the phone (nil = don't). `backoff`: check-ins in a row that
+    /// couldn't reach the relay; each doubles the interval, up to 4 hours (or the interval itself if longer).
+    func nextCheckIn(after date: Date, backoff: Int = 0) -> Date? {
+        // The next two times night starts or ends: the next period begins, then the one after it.
+        let changes = nightStartHour == nightEndHour ? [] : [nightStartHour, nightEndHour].compactMap {
+            Calendar.current.nextDate(after: date, matching: DateComponents(hour: $0, minute: 0, second: 0), matchingPolicy: .nextTime)
+        }.sorted()
+        let interval = wakeInterval(at: date)
+        guard interval > 0 else { return changes.first { wakeInterval(at: $0) > 0 } }
+        let at = date.addingTimeInterval(min(interval * pow(2, Double(min(backoff, 6))), max(interval, 240)) * 60)
+        guard let change = changes.first, change < at else { return at }
+        let next = wakeInterval(at: change)
+        if next >= interval { return at }   // a longer interval follows: this wake is just its first
+        if next > 0 { return change }       // a shorter one follows: start it on time
+        return changes.dropFirst().first    // none follows: wake when this period comes back
     }
 }
 
@@ -79,6 +131,8 @@ struct AgentSession: Identifiable {
     let subagents: Int
     /// Most recent heartbeat of the main turn or any subagent.
     let lastHeartbeat: Double?
+    /// When the oldest background subagent or task (shell) started, if only those keep the chat working.
+    let backgroundSince: Double?
     let state: State
     let queue: [QueuedPrompt]
     /// What the autopilot will do next, for display.
@@ -91,7 +145,11 @@ struct AgentSession: Identifiable {
 
     var stateText: String {
         switch state {
-        case .working: return "working " + AppDelegate.elapsed(since: turn?.startedAt ?? startedAt)
+        case .working:
+            if turn == nil, let bg = backgroundSince {
+                return (subagents > 0 ? "subagents " : "background task ") + AppDelegate.elapsed(since: bg)
+            }
+            return "working " + AppDelegate.elapsed(since: turn?.startedAt ?? startedAt)
         case .idle: return presence?.lastStopAt.map { "idle " + AppDelegate.elapsed(since: $0) } ?? "idle"
         case .limited(let until):
             return until > Date().timeIntervalSince1970 ? "usage limit until \(Autopilot.clock(until))"
@@ -130,6 +188,8 @@ final class Autopilot: ObservableObject {
     private var pendingNewChat: PendingNewChat?
     /// Why the Mac should stay awake for the autopilot (a continue, nudge or queued prompt is pending).
     private(set) var keepAwakeReasons: [String] = []
+    /// When the next continue after a usage limit is due, so a sleeping Mac can wake up for it.
+    private(set) var nextContinueAt: Double?
 
     private var lastPrune: Double = 0
     /// Chats run with `claude -p`: their queue is run by HeadlessRunner with --resume once the
@@ -137,7 +197,17 @@ final class Autopilot: ObservableObject {
     var isHeadless: (String) -> Bool = { _ in false }
 
     init() {
-        if !FileManager.default.fileExists(atPath: AutopilotSettings.url.path) { settings.save() }
+        // Write settings added since (with their defaults), so settings.json lists every option.
+        // Only add what's missing: a file that doesn't parse (a typo) or has values load() rejects stays as it is.
+        let url = AutopilotSettings.url
+        guard let data = try? Data(contentsOf: url) else { settings.save(); return }
+        guard var onDisk = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let all = (try? JSONEncoder().encode(settings)).flatMap({ try? JSONSerialization.jsonObject(with: $0) }) as? [String: Any],
+              !Set(all.keys).isSubset(of: onDisk.keys) else { return }
+        onDisk.merge(all) { old, _ in old }
+        if let out = try? JSONSerialization.data(withJSONObject: onDisk, options: [.prettyPrinted, .sortedKeys]) {
+            try? out.write(to: url, options: .atomic)
+        }
     }
 
     private static let idleSettle: Double = 5
@@ -147,7 +217,8 @@ final class Autopilot: ObservableObject {
 
     // MARK: - Registry
 
-    static func collectSessions(stallMinutes: Double = AutopilotSettings.load().stallMinutes) -> [AgentSession] {
+    static func collectSessions(stallMinutes: Double = AutopilotSettings.load().stallMinutes,
+                                maxNudges: Int = AutopilotSettings.load().maxNudges) -> [AgentSession] {
         struct Group { var presence: Marker?; var turn: Marker?; var subs: [Marker] = [] }
         var groups: [String: Group] = [:]
         let table = ProcessTree.snapshot()
@@ -164,33 +235,53 @@ final class Autopilot: ObservableObject {
         }
 
         let now = Date().timeIntervalSince1970
-        let staleAfter = ActivityMonitor.Config().staleAfter
         return groups.compactMap { key, g -> AgentSession? in
             guard let any = g.presence ?? g.turn ?? g.subs.first else { return nil }
             // A turn interrupted with Esc never fires Stop; the transcript says so.
             let turn = g.turn.flatMap { t in
                 SessionInbox.lastTurnInterrupted(transcript: g.presence?.transcript, after: t.startedAt) ? nil : t
             }
-            let subs = g.subs.filter { now - $0.touchedAt < staleAfter }
-            let heartbeat = ([turn].compactMap { $0 } + subs).map(\.touchedAt).max()
-            // A long-running shell (build, tests) is working, not stalled, even without hook heartbeats.
-            let shellRunning = !ProcessTree.longRunningShellChildren(of: any.pid, in: table, minAge: minShellAge).isEmpty
+            // Subagents still registered (SubagentStop removes them), silent ones too: their work isn't done. Not those
+            // of a turn interrupted with Esc (stopped with it), nor any silent past the last nudge (gone without a trace).
+            let interruptedAt = turn == nil ? g.turn?.startedAt : nil
+            let subs = g.subs.filter { s in
+                interruptedAt.map { s.startedAt < $0 } ?? true
+                    && (s.openTools?.isEmpty == false || now - s.touchedAt < stallMinutes * 60 * Double(maxNudges + 1))
+            }
+            let actors = [turn].compactMap { $0 } + subs
+            let heartbeat = actors.map(\.touchedAt).max()
+            let shells = ProcessTree.longRunningShellChildren(of: any.pid, in: table, minAge: minShellAge)
+            // A shell running during a Bash call is a build or tests: working, even without heartbeats. Without
+            // one it is background work (a dev server, a watcher) that says nothing about the turn.
+            // Markers from before tool calls were tracked (openTools nil) count any shell.
+            let inTool = actors.contains { $0.openTools?.isEmpty != true }
+            let silent = !(inTool && !shells.isEmpty) && heartbeat.map { now - $0 >= stallMinutes * 60 } == true
+            let waiting = g.presence?.awaitingInputAt
 
             let state: AgentSession.State
-            if turn == nil && subs.isEmpty {
-                if let reset = g.presence?.limitResetAt { state = .limited(until: reset) } else { state = .idle }
-            } else if turn != nil, let waiting = g.presence?.awaitingInputAt {
-                state = .waiting(since: waiting)
-            } else if let heartbeat, turn != nil, !shellRunning, now - heartbeat >= stallMinutes * 60 {
-                state = .stalled(since: heartbeat)
-            } else {
+            if turn != nil {
+                if let waiting { state = .waiting(since: waiting) }
+                else if silent, let heartbeat { state = .stalled(since: heartbeat) }
+                else { state = .working }
+            } else if let reset = g.presence?.limitResetAt {
+                state = .limited(until: reset)
+            } else if !subs.isEmpty {
+                // The turn is over, background subagents still run: Claude goes on when they report back.
+                if let waiting, waiting >= heartbeat ?? 0 { state = .waiting(since: waiting) }
+                else if silent, let heartbeat { state = .stalled(since: heartbeat) }
+                else { state = .working }
+            } else if !shells.isEmpty {
+                // The turn is over, but a background task (tests, a build) still runs: Claude picks up its result when it ends.
                 state = .working
+            } else {
+                state = .idle
             }
             return AgentSession(id: key, agent: any.agent, session: any.session, pid: any.pid,
                                 cwd: g.presence?.cwd ?? any.cwd,
                                 title: SessionInbox.title(transcript: g.presence?.transcript) ?? g.presence?.title,
-                                presence: g.presence, turn: turn, subagents: subs.count,
-                                lastHeartbeat: heartbeat, state: state, queue: PromptQueue.load(key))
+                                presence: g.presence, turn: turn, subagents: subs.count, lastHeartbeat: heartbeat,
+                                backgroundSince: turn == nil ? (subs.map(\.startedAt) + shells.map(\.startTime)).min() : nil,
+                                state: state, queue: PromptQueue.load(key))
         }
         .sorted { $0.startedAt < $1.startedAt }
     }
@@ -201,7 +292,7 @@ final class Autopilot: ObservableObject {
         let now = Date().timeIntervalSince1970
         let onDisk = AutopilotSettings.load() // pick up hand edits of settings.json
         if onDisk != settings { settings = onDisk }
-        var list = Self.collectSessions(stallMinutes: settings.stallMinutes)
+        var list = Self.collectSessions(stallMinutes: settings.stallMinutes, maxNudges: settings.maxNudges)
         let byId = Dictionary(list.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
 
         // Forget state of closed sessions.
@@ -218,7 +309,16 @@ final class Autopilot: ObservableObject {
         resolveNewChat(list, now: now)
         pruneQueues(of: byId, now: now)
         keepAwakeReasons = list.compactMap { keepAwakeReason($0, now: now) } + (pendingNewChat.map { _ in ["opening a new chat"] } ?? [])
+        nextContinueAt = settings.autoContinue ? list.compactMap { continueAt($0) }.min() : nil
         sessions = list
+    }
+
+    /// When the continue prompt goes to a chat stopped by a usage limit: a minute after the reset, not sooner
+    /// than minContinueInterval after the last try (a reset time in the past would retry every tick).
+    private func continueAt(_ s: AgentSession) -> Double? {
+        guard case .limited(let until) = s.state, s.agent == "claude", s.canReceive else { return nil }
+        let at = max(until + 60, (lastContinue[s.id] ?? 0) + HeadlessRunner.minContinueInterval)
+        return blocked[s.id].map { max(at, $0.at + Self.blockedRetry) } ?? at
     }
 
     /// Something the autopilot will do for this chat that needs the Mac awake, if any.
@@ -236,7 +336,12 @@ final class Autopilot: ObservableObject {
         case .idle:
             guard settings.queueEnabled, let item = s.queue.first else { return nil }
             return item.mode == .newChat && s.cwd == nil ? nil : "\(label(s)): queued prompt"
-        case .working, .waiting:
+        case .working:
+            // Activity monitoring lets a silent turn go after 20 minutes: with a longer stallMinutes, stay up for the nudge.
+            guard settings.stallNudge, s.turn != nil || s.subagents > 0, let hb = s.lastHeartbeat,
+                  now - hb >= ActivityMonitor.Config().staleAfter, now - hb < settings.stallMinutes * 60 else { return nil }
+            return "\(label(s)): nudge if still silent"
+        case .waiting:
             return nil
         }
     }
@@ -282,10 +387,9 @@ final class Autopilot: ObservableObject {
         if let b = blocked[s.id] { return "paused: \(b.reason)" }
 
         switch s.state {
-        case .limited(let until):
+        case .limited:
             guard settings.autoContinue else { return "usage limit (auto-continue off)" }
-            // Not sooner than minContinueInterval after the last try: a reset time in the past would retry every tick.
-            let at = max(until + 60, (lastContinue[s.id] ?? 0) + HeadlessRunner.minContinueInterval)
+            guard let at = continueAt(s) else { return nil }
             if now >= at {
                 // limitResetAt stays until the turn starts (the UserPromptSubmit hook clears it): if none does,
                 // the delivery times out, the chat is paused for a while, and the next try comes after that.
@@ -301,7 +405,8 @@ final class Autopilot: ObservableObject {
             let wait = settings.stallMinutes * 60
             if n.count >= settings.maxNudges { return "stalled (gave up after \(n.count) nudges)" }
             if n.count == 0 || now - n.at >= wait {
-                if deliver(settings.statusPrompt, to: s, now: now, expectTurn: false) {
+                // Mid-turn Claude reads it between tool calls; after the turn (background subagents) it starts one.
+                if deliver(settings.statusPrompt, to: s, now: now, expectTurn: s.turn == nil) {
                     n = (since, now, n.count + 1)
                 }
                 nudges[s.id] = n
@@ -311,10 +416,10 @@ final class Autopilot: ObservableObject {
             return "nudge again in \(formatDuration(n.at + wait - now))"
 
         case .working:
-            if let hb = s.lastHeartbeat, settings.stallNudge {
-                return s.turn == nil ? nil : "nudge in \(formatDuration(hb + settings.stallMinutes * 60 - now))"
-            }
-            return nil
+            // Silent turn or background subagent: count down to the nudge (past it, a build or tests are running).
+            guard settings.stallNudge, s.turn != nil || s.subagents > 0, let hb = s.lastHeartbeat else { return nil }
+            let left = hb + settings.stallMinutes * 60 - now
+            return left > 0 ? "nudge in \(formatDuration(left))" : nil
 
         case .waiting:
             return "waiting for you in the chat (no nudges)"
@@ -426,13 +531,13 @@ final class Autopilot: ObservableObject {
     // MARK: - Manual actions (Agents window, CLI)
 
     func sendNow(_ text: String, to id: String) {
-        guard let s = Self.collectSessions(stallMinutes: settings.stallMinutes).first(where: { $0.id == id }) else { return }
+        guard let s = Self.collectSessions(stallMinutes: settings.stallMinutes, maxNudges: settings.maxNudges).first(where: { $0.id == id }) else { return }
         blocked[id] = nil
         // Mid-turn, Claude reads the message between tool calls and no new turn starts.
         let expectTurn: Bool
         switch s.state {
         case .idle, .limited: expectTurn = true
-        case .working, .stalled, .waiting: expectTurn = false
+        case .working, .stalled, .waiting: expectTurn = s.turn == nil // only background work left: it starts a new turn
         }
         deliver(text, to: s, now: Date().timeIntervalSince1970, expectTurn: expectTurn)
         tick()

@@ -53,7 +53,7 @@ Choose **Show Agents…** in the menu (⌘A while the menu is open), or run `Vib
 
 | Dot | State |
 |---|---|
-| Green | Working on a turn |
+| Green | Working on a turn, or running a background task (tests, a build) after it |
 | Grey | Idle, waiting for a prompt |
 | Purple | Stopped by a usage limit; shows when it resets |
 | Orange | Working, but no sign of life for 20 minutes or more |
@@ -61,15 +61,15 @@ Choose **Show Agents…** in the menu (⌘A while the menu is open), or run `Vib
 
 The autopilot acts on these chats by sending prompts into them. It can be switched on or off per feature at the bottom of the window:
 
-- **Continue after usage limit.** When a turn fails with a usage limit, VibeWake sends `continue` one minute after the limit resets. If the limit is still active, the new failure schedules the next attempt.
-- **Nudge stalled chats.** When a turn shows no tool activity for 20 minutes, VibeWake sends `what is the status?`. It nudges again every 20 minutes, at most three times, until the chat shows activity again. A chat interrupted with Esc is not considered stalled, and neither is one waiting for you to answer a permission prompt or question. That chat isn't nudged and doesn't keep the Mac awake, since nothing happens until you answer.
+- **Continue after usage limit.** When a turn fails with a usage limit, VibeWake sends `continue` one minute after the limit resets. It reads the reset time from the transcript, or else from the message ("resets 3:40am (Europe/Berlin)"); if neither has one, it tries again after 15 minutes. If the limit is still active, the new failure schedules the next attempt. If the Mac sleeps before then anyway, VibeWake schedules a wake for that time (not while paused).
+- **Nudge stalled chats.** When a turn shows no activity for 20 minutes, VibeWake sends `what is the status?`. The same goes for a background subagent that is still registered after the turn ended. It nudges again every 20 minutes, at most three times, until the chat shows activity again. A chat interrupted with Esc is not considered stalled, and neither is one waiting for you to answer a permission prompt, a question or a plan. That chat isn't nudged and doesn't keep the Mac awake, since nothing happens until you answer.
 - **Run queues.** Each chat has a prompt queue. Every time the chat finishes a turn, the next prompt is sent:
   - **Same chat** sends it into the same conversation.
   - **New chat** opens a new Claude Code tab in VS Code for the same project and sends the prompt there once the tab has started. If the new tab doesn't register within 60 seconds, VibeWake opens it with the prompt pre-filled instead, and you press Enter.
 
 While the autopilot has something pending, VibeWake keeps the Mac awake as if an agent were working, including with the lid closed. This covers a `continue` waiting for a usage limit to reset (which can mean hours with the lid closed), a stalled chat that hasn't had all its nudges, and a queued prompt waiting to run. Otherwise the Mac would sleep after the last turn ends and the autopilot couldn't act. The low-battery rule still applies, and **Pause** turns this off too.
 
-A chat counts as stalled only if no shell command is running in it, so a long build or test run isn't nudged. If a queued prompt doesn't start a turn, it goes back to the front of the queue. Queues of chats that have closed (including after `/clear`) are dropped, and each dropped prompt is logged.
+A chat isn't stalled while a tool call runs a shell command, so a long build or test run isn't nudged. A process running in the background, such as a dev server or a watcher, doesn't count: a turn that has gone silent next to one is nudged. If a queued prompt doesn't start a turn, it goes back to the front of the queue. Queues of chats that have closed (including after `/clear`) are dropped, and each dropped prompt is logged.
 
 The window also has **Ask for status**, **Continue** and **Send now** buttons for doing this by hand. If a prompt can't be delivered, or doesn't start a turn within two minutes, the autopilot pauses for that chat for 10 minutes. **Resume autopilot** restarts it right away.
 
@@ -82,6 +82,22 @@ VibeWake queue <id-prefix|title> [--new-chat] <text>   # add to the queue
 ```
 
 The prompts, the stall threshold, the maximum number of nudges and the editor URL scheme (`vscode` by default, `cursor` for Cursor) are stored in `~/.vibewake/state/settings.json`. Queues are stored in `~/.vibewake/queue/`.
+
+### Closing what a chat leaves running
+
+When a Claude Code chat ends, VibeWake stops the processes it started and left running. A chat ends when you close it, run `/clear`, or its process exits or crashes. This covers dev servers, watchers, `run_in_background` commands and anything they started, including processes detached with `&` or `nohup`. Each one gets SIGTERM, then SIGKILL if it is still running 5 seconds later. The log lists what was closed.
+
+VibeWake finds these processes in two ways. Each shell Claude Code starts runs in its own process group, which VibeWake notes while the chat runs. Claude Code also sets `CLAUDE_PID` and `CLAUDE_CODE_SESSION_ID` in the environment of everything it starts. VibeWake never closes:
+
+- another running chat, or the editor or terminal it runs in
+- VibeWake itself
+- the chat's own process and its MCP servers after `/clear`
+- anything started through `open`, `brew services` or Docker, since these run outside the chat
+- anything left by a chat that ended while VibeWake wasn't running
+
+While a chat runs, a background task keeps it **working**, so the phone doesn't show it as finished while its tests still run. The block VibeWake adds to `~/.claude/CLAUDE.md` asks Claude to stop the background processes it no longer needs before it ends a turn. VibeWake refreshes that block on launch.
+
+To turn this off, uncheck **Close leftovers** at the bottom of the Agents window, or set `closeLeftovers` to `false` in `settings.json`.
 
 ### How prompts are delivered
 
@@ -112,11 +128,11 @@ What the phone can do on the Mac:
 
 - **Queue and send prompts** to existing chats, just like the Agents window.
 - **Start a new chat** in a project folder the Mac already works in. If someone is at the Mac (screen unlocked, lid open), it opens a new editor tab as a queued "new chat" does. Otherwise it runs headless with `claude -p` in that folder (permission mode from `headlessPermissionMode`, default `acceptEdits`), and later prompts continue it with `--resume`. Set `remoteNewChats` to `headless` or `editor` to always use one.
-- **Wake a sleeping Mac.** A sleeping Mac can't be reached, so before sleeping VibeWake schedules a wake (`pmset schedule wake`) every `wakeIntervalMinutes` (default 15, `0` = never; skipped on battery below 20%). On waking it connects, picks up what the phone sent meanwhile, and goes back to sleep if there is nothing to do. The phone shows when the next check-in is.
+- **Wake a sleeping Mac.** A sleeping Mac can't be reached, so before sleeping VibeWake schedules a wake (`pmset schedule wake`) to check for requests: every 15 minutes by day and every hour at night (23:00–06:00) by default. It skips this on battery below 20%. On waking it connects, picks up what the phone sent meanwhile, and goes back to sleep if there is nothing to do. The phone shows when the next check-in is. To change how often it checks, or to turn checking off by day or at night, use **Check for Phone Requests** in the menu, or the pickers under **Phone app** in the Agents window.
 
 **Allow remote control** (Phone app bar) turns all of this off: the phone can then only watch. Run `VibeWake remote status` to see the setup, `VibeWake remote off` to disconnect.
 
-New settings in `settings.json`: `remoteControl`, `wakeIntervalMinutes`, `remoteNewChats` (`auto` | `headless` | `editor`), `headlessPermissionMode`, `claudePath` (default: `claude` on your login shell's PATH, else the binary inside the VS Code / Cursor extension), and `remoteProjects` (extra folders the phone may start chats in, besides those of recent chats).
+New settings in `settings.json`: `remoteControl`, `wakeIntervalMinutes` (by day, default 15, `0` = never), `nightWakeIntervalMinutes` (default 60, `0` = never), `nightStartHour` and `nightEndHour` (default 23 and 6), `remoteNewChats` (`auto` | `headless` | `editor`), `headlessPermissionMode`, `claudePath` (default: `claude` on your login shell's PATH, else the binary inside the VS Code / Cursor extension), and `remoteProjects` (extra folders the phone may start chats in, besides those of recent chats).
 
 What goes through the relay: chat titles, folders, states, queued prompts and replies (the first 8 KB, the rest on request). Inbox sockets and tokens never leave the Mac. Machine and phone tokens are stored hashed on the relay; the Mac's token is in `~/.vibewake/state/remote.json` (mode 0600).
 
@@ -136,7 +152,7 @@ Choose **Show Logs…** in the menu (⌘L while the menu is open), or run `VibeW
 |---|---|
 | `[claude]` / `[pi]` | Session opened or closed, prompt submitted, turn finished (with duration), subagent started or finished |
 | `[autopilot]` | Prompts sent by the autopilot or `VibeWake send`, and failed deliveries |
-| `[session]` | What VibeWake counts as active: STARTED / FINISHED (with duration), subagent and shell-task counts, crashed agents |
+| `[session]` | What VibeWake counts as active: STARTED / FINISHED (with duration), subagent and shell-task counts, crashed agents, processes closed after a chat ended |
 | `[state]` | Switches between ACTIVE, IDLE and PAUSED |
 | `[sleep]` | Power assertion on/off, `disablesleep` on/off (or a failure), forced sleep after work ends with the lid closed, low-battery override |
 | `[system]` | Mac going to sleep or waking up, display sleep or wake, lid closed or opened |

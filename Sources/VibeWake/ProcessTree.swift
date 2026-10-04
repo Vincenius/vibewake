@@ -4,6 +4,8 @@ import Foundation
 struct ProcInfo {
     let pid: Int32
     let ppid: Int32
+    /// Process group: each Bash tool shell of Claude Code leads its own, and what it starts stays in it.
+    let pgid: Int32
     let name: String      // p_comm (max 16 chars)
     let startTime: Double // seconds since epoch
 }
@@ -33,7 +35,7 @@ enum ProcessTree {
             }
             let tv = p.kp_proc.p_un.__p_starttime
             let start = Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000
-            result[pid] = ProcInfo(pid: pid, ppid: p.kp_eproc.e_ppid, name: name, startTime: start)
+            result[pid] = ProcInfo(pid: pid, ppid: p.kp_eproc.e_ppid, pgid: p.kp_eproc.e_pgid, name: name, startTime: start)
         }
         return result
     }
@@ -44,10 +46,46 @@ enum ProcessTree {
 
     /// Whether the process a marker was written for still runs (not just some process with a reused pid).
     static func isAlive(_ marker: Marker, in table: [Int32: ProcInfo]) -> Bool {
-        guard let p = table[marker.pid] else { return isAlive(marker.pid) }
-        guard let start = marker.pidStart else { return true }
+        isAlive(marker.pid, start: marker.pidStart, in: table)
+    }
+
+    static func isAlive(_ pid: Int32, start: Double?, in table: [Int32: ProcInfo]) -> Bool {
+        guard let p = table[pid] else { return isAlive(pid) }
+        guard let start else { return true }
         return abs(p.startTime - start) < 0.5
     }
+
+    /// Environment of a process of this user (KERN_PROCARGS2), nil if it can't be read.
+    /// Empty for Apple's own binaries (/bin/zsh, /bin/sleep, …): macOS hides theirs from other processes.
+    static func environment(of pid: Int32) -> [String: String]? {
+        var mib: [Int32] = [CTL_KERN, KERN_PROCARGS2, pid]
+        var size = argMax
+        var buf = [UInt8](repeating: 0, count: size)
+        guard sysctl(&mib, 3, &buf, &size, nil, 0) == 0, size > MemoryLayout<Int32>.size else { return nil }
+        // Layout: argc, exec path, NUL padding, argv[argc], then the environment, each NUL-terminated.
+        let argc = buf.withUnsafeBytes { $0.load(as: Int32.self) }
+        var i = MemoryLayout<Int32>.size
+        func skipString() { while i < size && buf[i] != 0 { i += 1 }; i += 1 }
+        skipString()
+        while i < size && buf[i] == 0 { i += 1 }
+        for _ in 0..<max(0, argc) { skipString() }
+        var env: [String: String] = [:]
+        while i < size && buf[i] != 0 {
+            let start = i
+            while i < size && buf[i] != 0 { i += 1 }
+            let entry = String(decoding: buf[start..<i], as: UTF8.self)
+            if let eq = entry.firstIndex(of: "=") { env[String(entry[..<eq])] = String(entry[entry.index(after: eq)...]) }
+            i += 1
+        }
+        return env
+    }
+
+    private static let argMax: Int = {
+        var mib: [Int32] = [CTL_KERN, KERN_ARGMAX]
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        return sysctl(&mib, 2, &value, &size, nil, 0) == 0 && value > 0 ? Int(value) : 1 << 20
+    }()
 
     /// Start time of one process (seconds since epoch).
     static func startTime(of pid: Int32) -> Double? {

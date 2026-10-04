@@ -125,7 +125,8 @@ case "remote":
         if let c = RemoteConfig.load() { print("server: \(c.serverURL)\nmachine: \(c.machineId) (\(RemoteConfig.machineName))") }
         else { print("not set up — VibeWake remote setup <server-url> <setup-code>") }
         let s = AutopilotSettings.load()
-        print("remote control: \(s.remoteControl ? "on" : "off"), wake every: \(s.wakeIntervalMinutes == 0 ? "never" : "\(Int(s.wakeIntervalMinutes)) min")")
+        print("remote control: \(s.remoteControl ? "on" : "off"), check for requests while asleep: "
+              + "\(AutopilotSettings.describeInterval(s.wakeIntervalMinutes)), at night (\(s.nightHours)) \(AutopilotSettings.describeInterval(s.nightWakeIntervalMinutes))")
         HeadlessRunner.resolveEnvironment()
         print("claude binary: \(HeadlessRunner.claudeBinary(s) ?? "not found")")
         exit(0)

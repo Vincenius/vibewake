@@ -118,7 +118,7 @@ final class SleepController {
 
     /// Replace our scheduled wake (only ours: other wakes in `pmset -g sched` are left alone).
     @discardableResult
-    func scheduleWake(at date: Date) -> Bool {
+    func scheduleWake(at date: Date, why: String) -> Bool {
         cancelWake()
         let s = Self.wakeFormat.string(from: date)
         guard run(Self.sudo, ["-n", Self.pmset, "schedule", "wake", s]) == 0 else {
@@ -127,7 +127,7 @@ final class SleepController {
         }
         Paths.ensure()
         try? s.write(to: Paths.scheduledWake, atomically: true, encoding: .utf8)
-        Log.write("sleep", "Scheduled a wake at \(s) to check for prompts from the phone")
+        Log.write("sleep", "Scheduled a wake at \(s) \(why)")
         return true
     }
 

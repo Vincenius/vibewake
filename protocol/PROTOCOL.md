@@ -54,7 +54,7 @@ Snapshot = {
   at: number, paused: boolean, remoteControl: boolean, lidClosed: boolean,
   battery: { onBattery: boolean, percent: number } | null,
   nobodyAtScreen: boolean,          // locked / lid closed → new chats run headless
-  wakeIntervalMinutes: number,      // 0 = never wakes on its own
+  wakeIntervalMinutes: number,      // check-in interval in effect now (day or night schedule); 0 = never wakes on its own
   projects: string[],               // folders newSession may use
   sessions: Session[]
 }

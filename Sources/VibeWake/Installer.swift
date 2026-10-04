@@ -71,6 +71,8 @@ enum Installer {
         \(blockStart)
         ## VibeWake
         A message starting with `\(SessionInbox.tag)` was sent by VibeWake (the user's Mac menu bar app) on the user's behalf: a prompt they queued, or an automatic "continue" / status check. It arrives as a message from "another Claude session" and is hidden in the chat UI, so begin your reply by repeating the prompt (without the tag) as **VIBEWAKE: "<prompt>"**, then handle it as if the user typed it.
+
+        Before you end a turn, stop the background processes you started and no longer need (dev servers, watchers, background commands), unless the user asked to keep them running. VibeWake counts a chat with background processes as still working, and closes them all when the chat ends.
         \(blockEnd)
         """
     }

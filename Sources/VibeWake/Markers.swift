@@ -18,6 +18,9 @@ struct Marker: Codable {
     var startedAt: Double
     var touchedAt: Double
     var label: String?
+    /// Turn and subagent markers: Bash calls started (PreToolUse) and not yet finished. A shell that runs
+    /// during one is a build or tests; without one it is background work. nil: written before this was tracked.
+    var openTools: [String]?
     // Session markers only (Claude Code): how to reach and describe the chat.
     /// Inbox socket of the session (CLAUDE_CODE_MESSAGING_SOCKET) and its token.
     var socket: String?
@@ -121,6 +124,15 @@ enum MarkerStore {
 
     static func remove(_ url: URL) {
         try? FileManager.default.removeItem(at: url)
+    }
+
+    /// Subagent markers of one session, with the subagent id their file is named after.
+    static func subagents(agent: String, session: String) -> [(id: String, url: URL)] {
+        let prefix = "\(sanitize(agent))-\(sanitize(session)).sub-"
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: Paths.active.path)) ?? []
+        return files.filter { $0.hasPrefix(prefix) && $0.hasSuffix(".json") }.map {
+            (String($0.dropFirst(prefix.count).dropLast(5)), Paths.active.appendingPathComponent($0))
+        }
     }
 
     /// Remove every marker belonging to one agent session.

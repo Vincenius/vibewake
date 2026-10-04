@@ -139,9 +139,9 @@ final class HeadlessRunner {
                         let text = obj["result"] as? String
                         let isError = obj["is_error"] as? Bool == true
                         result = isError ? (nil, text ?? obj["subtype"] as? String ?? "failed") : (text, nil)
-                        if isError, rejected || obj["api_error_status"] as? Int == 429 || Self.isUsageLimit(text) {
+                        if isError, rejected || obj["api_error_status"] as? Int == 429 || UsageLimit.isLimitMessage(text) {
                             limited = true
-                            reset = reset ?? Self.resetTime(in: text)
+                            reset = reset ?? UsageLimit.resetTime(in: text)
                         }
                     }
                 }
@@ -169,18 +169,6 @@ final class HeadlessRunner {
             chats.append(HeadlessChat(session: session, cwd: cwd, transcript: Self.transcriptPath(cwd: cwd, session: session), startedAt: now))
         }
         save()
-    }
-
-    /// "Claude AI usage limit reached|<epoch>", "You've hit your limit · resets 5pm", "5-hour limit reached".
-    private static func isUsageLimit(_ text: String?) -> Bool {
-        guard let t = text?.lowercased() else { return false }
-        return ["usage limit", "limit reached", "hit your limit", "rate limit"].contains { t.contains($0) }
-    }
-
-    /// The reset time in "…usage limit reached|1759420800".
-    private static func resetTime(in text: String?) -> Double? {
-        guard let text, let r = text.range(of: #"\|\d{10}\b"#, options: .regularExpression) else { return nil }
-        return Double(text[r].dropFirst())
     }
 
     private func finished(_ id: ObjectIdentifier, result: String?, error: String?, limited: Bool = false, reset: Double?) {
