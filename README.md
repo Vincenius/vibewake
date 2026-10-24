@@ -1,6 +1,6 @@
 # VibeWake
 
-A menu bar app that keeps your Mac awake, **even with the lid closed**, while AI coding agents are working. It restores normal sleep once they're done.
+A menu bar app that keeps your Mac awake, **even with the lid closed**, while AI agents are working (Claude Code, Codex, pi, and agents in LM Studio or Bionic). It restores normal sleep once they're done.
 
 | Icon | Meaning |
 |---|---|
@@ -39,6 +39,7 @@ The app counts an agent as busy when any of the following is true:
 | pi extension | From `agent_start` until `agent_settled`. Retries, compaction and queued follow-ups are included. pi-subagents register themselves. |
 | Background tasks | An agent process (`claude`, `codex`, or a pi with a registered session) has a shell child that has run for 5 seconds or more. This covers `run_in_background` commands and long foreground commands. |
 | Process fallback | `codex`, `opencode`, `gemini` or `aider` uses more than 3% CPU, or has a running shell child. |
+| LM Studio / Bionic | While LM Studio or Bionic runs, VibeWake asks `lms ps` every 5 seconds whether a local model is generating. It counts as busy from the first generation until 2 minutes after the last one, so the tool calls between generations are covered. Both apps share one inference engine in `~/.lmstudio`, so this covers chats and agents in either app, and requests to LM Studio's local server. |
 
 Hooks write small JSON markers to `~/.vibewake/active/`. The rules for clearing them:
 

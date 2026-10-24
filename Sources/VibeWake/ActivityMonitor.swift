@@ -30,6 +30,7 @@ final class ActivityMonitor {
 
     var config = Config()
     private var lastCpu: [Int32: (cpu: Double, at: Double)] = [:]
+    private let localLLM = LocalLLMMonitor()
 
     func evaluate() -> [ActiveItem] {
         let now = Date().timeIntervalSince1970
@@ -105,6 +106,8 @@ final class ActivityMonitor {
             }
         }
         lastCpu = lastCpu.filter { seenCpu.contains($0.key) }
+
+        items += localLLM.evaluate(table: table, now: now)
 
         return items.sorted { $0.since < $1.since }
     }
